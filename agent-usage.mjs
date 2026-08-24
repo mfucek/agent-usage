@@ -1,17 +1,25 @@
 #!/usr/bin/env node
-// agent-usage — live Claude (Max/Pro OAuth) quota in the terminal.
+// agent-usage — live Claude (Max/Pro OAuth) quota in the terminal, multi-account.
 //
 // Reads the Claude Code OAuth token from the macOS keychain, polls the
 // zero-spend usage endpoint (`/api/oauth/usage`) and renders a teamclaude-style
 // status panel. Local transcripts (~/.claude/projects) are scanned incrementally
 // to show requests/tokens in the current 5h session window.
 //
+// Every account it ever sees logged in is archived (tokens + last usage) under
+// ~/.local/state/agent-usage/accounts/. Archived accounts render as gray cards
+// below the active one and can be switched into (↑/↓ + Enter): the archived
+// OAuth blob is written back to the keychain + ~/.claude.json, so the next
+// `claude` you start runs as that account.
+//
 // Zero dependencies. Node >= 18 (or bun).
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync, existsSync, writeFileSync, renameSync } from 'node:fs';
+import {
+  readFileSync, readdirSync, statSync, openSync, readSync, closeSync, existsSync,
+  writeFileSync, renameSync, unlinkSync, mkdirSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
-import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -27,11 +35,16 @@ usage: agent-usage [options]
   (no args)        live mode: re-probe every 60s
   -i, --interval N probe interval in seconds (min 30, default 60)
   -1, --once       print once and exit
-  --json           print raw usage JSON and exit
+  --json           print raw usage JSON (active account) and exit
   --no-local       skip local transcript scan (Usage row)
   --no-color       disable ANSI colors
 
-live keys: r = probe now, q = quit`);
+accounts (archived under ~/.local/state/agent-usage/accounts/):
+  --accounts       list archived accounts and exit
+  --switch EMAIL   make EMAIL the logged-in Claude Code account and exit
+  --forget EMAIL   delete EMAIL's archived tokens/usage and exit
+
+live keys: ↑/↓ select account · enter switch · r probe now · q quit`);
   process.exit(0);
 }
 
@@ -47,28 +60,45 @@ const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 const CRED_FILE = join(HOME, '.claude', '.credentials.json');
 const CLAUDE_JSON = join(HOME, '.claude.json');
 const PROJECTS_DIR = join(HOME, '.claude', 'projects');
+const STATE_DIR = join(HOME, '.local', 'state', 'agent-usage');
+const ACCOUNTS_DIR = join(STATE_DIR, 'accounts');
 // Shared with ~/.claude/statusline-command.sh: whoever fetched last writes here,
 // everyone else reads. One request per CACHE_TTL across all tools/sessions —
 // the endpoint is aggressively rate limited (429, retry-after: 0) and a 429
-// never clears while anything keeps polling.
+// never clears while anything keeps polling. Entries we write carry
+// `_account` so a cache left over from another account is never shown.
 const CACHE_FILE = '/tmp/.claude-usage-cache';
 const FAIL_FILE = `${CACHE_FILE}.fail`; // statusline's negative-cache stamp
 const CACHE_TTL_MS = 120_000;
 const MIN_BACKOFF_MS = 5 * 60_000;
 const MAX_BACKOFF_MS = 30 * 60_000;
 const FIVE_H = 5 * 3600 * 1000;
+const WEEK_MS = 7 * 24 * 3600 * 1000;
+const MSG_TTL_MS = 60_000;
 
 // ─── Credentials ────────────────────────────────────────────────────────────
-function loadCredentials() {
-  let raw = null;
+// The keychain item holds one JSON blob: { claudeAiOauth: {...}, mcpOAuth: {...} }.
+// Only claudeAiOauth is account-specific; mcpOAuth (Figma, Cloudflare, ...) is
+// shared and must survive a switch.
+function loadCredentialBlob() {
+  let raw = null, acct = process.env.USER || 'claude';
   if (process.platform === 'darwin') {
     try {
       raw = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+      const meta = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+      const m = meta.match(/"acct"<blob>="([^"]*)"/); if (m) acct = m[1];
     } catch { /* fall through */ }
   }
   if (!raw && existsSync(CRED_FILE)) raw = readFileSync(CRED_FILE, 'utf8');
-  if (!raw) throw new Error('no Claude Code credentials found (keychain or ~/.claude/.credentials.json). Log in with `claude` first.');
-  const o = JSON.parse(raw)?.claudeAiOauth;
+  let json = null;
+  if (raw) { try { json = JSON.parse(raw); } catch { json = null; } }
+  return { json, acct, fromKeychain: !!raw && process.platform === 'darwin' && !existsSync(CRED_FILE) };
+}
+
+function loadCredentials() {
+  const { json } = loadCredentialBlob();
+  if (!json) throw new Error('no Claude Code credentials found (keychain or ~/.claude/.credentials.json). Log in with `claude` first.');
+  const o = json.claudeAiOauth;
   if (!o?.accessToken) throw new Error('credentials found but no claudeAiOauth.accessToken. Log in with `claude` first.');
   return o;
 }
@@ -76,12 +106,99 @@ function loadCredentials() {
 function loadAccount() {
   try {
     const a = JSON.parse(readFileSync(CLAUDE_JSON, 'utf8'))?.oauthAccount || {};
-    return { email: a.emailAddress || null, org: a.organizationName || null, type: a.organizationType || null };
-  } catch { return { email: null, org: null, type: null }; }
+    return { email: a.emailAddress || null, org: a.organizationName || null, type: a.organizationType || null, raw: a };
+  } catch { return { email: null, org: null, type: null, raw: null }; }
+}
+
+function planLabel(oauth) {
+  const tier = (oauth?.rateLimitTier || '').replace(/^default_claude_/, '').replace('_', ' ');
+  const sub = oauth?.subscriptionType || '';
+  return tier.startsWith(sub) ? tier : [sub, tier].filter(Boolean).join(' ');
+}
+
+// ─── Account archive ────────────────────────────────────────────────────────
+// One file per account: { email, oauth, oauthAccount, usage, usageAt, seenAt }.
+// `oauth` is re-copied from the keychain on every probe while that account is
+// the logged-in one, so a refresh performed by Claude Code (rotated tokens) is
+// picked up within one interval.
+const accountFile = email => join(ACCOUNTS_DIR, `${email.toLowerCase().replace(/[^a-z0-9@._+-]/g, '_')}.json`);
+
+function readAccount(email) {
+  try { return JSON.parse(readFileSync(accountFile(email), 'utf8')); } catch { return null; }
+}
+function saveAccount(rec) {
+  mkdirSync(ACCOUNTS_DIR, { recursive: true, mode: 0o700 });
+  const f = accountFile(rec.email), tmp = `${f}.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
+  renameSync(tmp, f);
+}
+function listAccounts() {
+  const out = [];
+  for (const f of safeReaddir(ACCOUNTS_DIR)) {
+    if (!f.endsWith('.json')) continue;
+    try { const r = JSON.parse(readFileSync(join(ACCOUNTS_DIR, f), 'utf8')); if (r?.email) out.push(r); } catch { /* skip */ }
+  }
+  return out.sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0));
+}
+function forgetAccount(email) { try { unlinkSync(accountFile(email)); return true; } catch { return false; } }
+
+// Archive the currently logged-in account's tokens + identity. Returns the record.
+function archiveActive(oauth, account) {
+  if (!account?.email || !oauth?.accessToken) return null;
+  const rec = readAccount(account.email) || { email: account.email };
+  const changed = JSON.stringify(rec.oauth) !== JSON.stringify(oauth) || JSON.stringify(rec.oauthAccount) !== JSON.stringify(account.raw);
+  rec.oauth = oauth; rec.oauthAccount = account.raw; rec.seenAt = Date.now();
+  if (changed || !rec.savedAt || Date.now() - rec.savedAt > 10 * 60_000) { rec.savedAt = Date.now(); saveAccount(rec); }
+  return rec;
+}
+function archiveUsage(email, data, at) {
+  const rec = readAccount(email); if (!rec) return;
+  rec.usage = data; rec.usageAt = at; rec.savedAt = Date.now(); saveAccount(rec);
+}
+
+// ─── Switching ──────────────────────────────────────────────────────────────
+function countClaudeProcs() {
+  try { return execFileSync('pgrep', ['-x', 'claude'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n').filter(Boolean).length; } catch { return 0; }
+}
+
+function writeKeychain(acct, value) {
+  // NOTE: `security -i` (stdin) silently truncates lines at 4 KiB and the blob
+  // is ~10-15 KiB, so the value has to go via argv (same as Claude Code does).
+  execFileSync('security', ['add-generic-password', '-a', acct, '-s', KEYCHAIN_SERVICE, '-U', '-w', value], { stdio: ['ignore', 'ignore', 'pipe'] });
+  // Verify the round trip.
+  const back = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  if (back !== value) throw new Error('keychain write did not round-trip');
+}
+
+function switchTo(email) {
+  const rec = readAccount(email);
+  if (!rec?.oauth?.accessToken) throw new Error(`no archived tokens for ${email} — log in once with \`claude /login\` while agent-usage runs`);
+  const now = Date.now();
+  const rexp = Number(rec.oauth.refreshTokenExpiresAt) || 0;
+  if (rexp && rexp < now) throw new Error(`${email}: refresh token expired — run \`claude /login\` as that account`);
+
+  // Make sure whoever is logged in right now is archived before we overwrite them.
+  const blob = loadCredentialBlob();
+  const cur = loadAccount();
+  if (blob.json?.claudeAiOauth?.accessToken && cur.email) archiveActive(blob.json.claudeAiOauth, cur);
+  if (cur.email === email) return { already: true, running: countClaudeProcs() };
+
+  const next = { ...(blob.json || {}), claudeAiOauth: rec.oauth };
+  const serialized = JSON.stringify(next);
+  if (process.platform === 'darwin' && (blob.fromKeychain || !existsSync(CRED_FILE))) writeKeychain(blob.acct, serialized);
+  else { const tmp = `${CRED_FILE}.${process.pid}`; writeFileSync(tmp, serialized, { mode: 0o600 }); renameSync(tmp, CRED_FILE); }
+
+  if (rec.oauthAccount) {
+    let cj = {}; try { cj = JSON.parse(readFileSync(CLAUDE_JSON, 'utf8')); } catch { /* fresh */ }
+    cj.oauthAccount = rec.oauthAccount;
+    const tmp = `${CLAUDE_JSON}.${process.pid}`; writeFileSync(tmp, JSON.stringify(cj, null, 2)); renameSync(tmp, CLAUDE_JSON);
+  }
+  for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } }
+  return { already: false, running: countClaudeProcs() };
 }
 
 // ─── Probe ──────────────────────────────────────────────────────────────────
-async function fetchUsage(accessToken, timeoutMs = 10_000) {
+async function fetchUsage(accessToken, { cacheAs = null, timeoutMs = 10_000 } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -90,7 +207,7 @@ async function fetchUsage(accessToken, timeoutMs = 10_000) {
         Authorization: `Bearer ${accessToken}`,
         'anthropic-beta': 'oauth-2025-04-20',
         Accept: 'application/json',
-        'User-Agent': 'agent-usage/1.0',
+        'User-Agent': 'agent-usage/1.1',
       },
       signal: ctrl.signal,
     });
@@ -101,17 +218,18 @@ async function fetchUsage(accessToken, timeoutMs = 10_000) {
       return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status, retryAfterMs: ra * 1000 };
     }
     const data = await res.json();
-    writeCache(data);
+    if (cacheAs) writeCache({ ...data, _account: cacheAs });
     return { data, fetchedAt: Date.now() };
   } catch (err) {
     return { error: err?.name === 'AbortError' ? 'probe timed out' : (err?.message || String(err)) };
   } finally { clearTimeout(t); }
 }
 
-function readCache() {
+function readCache(email) {
   try {
     const st = statSync(CACHE_FILE);
     const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+    if (data?._account && email && data._account !== email) return null; // another account's numbers
     if (data?.five_hour || data?.limits) return { data, fetchedAt: st.mtimeMs };
   } catch { /* no cache */ }
   return null;
@@ -129,7 +247,7 @@ function normalize(data) {
 
   const limits = Array.isArray(data?.limits) ? data.limits : [];
   const byKind = k => limits.find(l => l.kind === k);
-  const session = bucket('Session', byKind('session')) || bucket('Session', data?.five_hour);
+  const session = bucket('Session', byKind('session'), { window: 'session' }) || bucket('Session', data?.five_hour, { window: 'session' });
   const weekly = bucket('Weekly', byKind('weekly_all')) || bucket('Weekly', data?.seven_day);
   if (session) rows.push(session);
   if (weekly) rows.push(weekly);
@@ -157,6 +275,19 @@ function normalize(data) {
     extra: { enabled: !!extra.is_enabled, percent: num(extra.utilization), used: extra.used_credits, limit: extra.monthly_limit },
     sessionResetsAt: session?.resetsAt || null,
   };
+}
+
+// Age stale rows: once a bucket's reset moment has passed, its bar is empty.
+// Weekly buckets recur on a fixed 7-day schedule, so the countdown rolls
+// forward; a 5h session window simply ends (a new one starts on first use).
+function projectRows(rows, now) {
+  return rows.map(r => {
+    const t = r.resetsAt ? Date.parse(r.resetsAt) : null;
+    if (!t || t > now) return r;
+    if (r.window === 'session') return { ...r, percent: r.percent == null ? null : 0, resetsAt: null, ended: true };
+    let n = t; while (n <= now) n += WEEK_MS;
+    return { ...r, percent: r.percent == null ? null : 0, resetsAt: new Date(n).toISOString(), ended: true, projected: true };
+  });
 }
 
 const num = v => (v == null || Number.isNaN(Number(v)) ? null : Number(v));
@@ -235,12 +366,13 @@ function gradientColor(i, width) {
   return from.map((v, k) => Math.round(v + (to[k] - v) * p));
 }
 
-function usageBar(percent, width = 18) {
+function usageBar(percent, width = 18, muted = false) {
   if (percent == null) return `[${paint.gray('?'.repeat(width))}]`;
   const ratio = Math.max(0, Math.min(1, percent / 100));
   const full = Math.round(ratio * width);
   let fill = '';
-  for (let i = 0; i < full; i++) { const [r, g, b] = gradientColor(i, width); fill += paint.rgb(r, g, b, '█'); }
+  if (muted) fill = paint.rgb(150, 150, 150, '█'.repeat(full));
+  else for (let i = 0; i < full; i++) { const [r, g, b] = gradientColor(i, width); fill += paint.rgb(r, g, b, '█'); }
   return `[${fill}${paint.gray('░'.repeat(width - full))}]`;
 }
 
@@ -258,11 +390,13 @@ function fmtDur(ms) {
   return hh ? `${d}d${hh}h` : `${d}d`;
 }
 
-function quotaLine(row, now) {
+function quotaLine(row, now, muted = false) {
   const resetTs = row.resetsAt ? Date.parse(row.resetsAt) : null;
-  const reset = resetTs && resetTs > now ? ` reset ${fmtDur(resetTs - now)}` : '';
-  const p = row.percent == null ? paint.gray('n/a') : pct(row.percent);
-  return `${paint.dim(row.label.padEnd(8))} ${usageBar(row.percent)} ${p}${reset}`;
+  let reset = resetTs && resetTs > now ? ` reset ${fmtDur(resetTs - now)}` : '';
+  if (row.ended && row.window === 'session') reset = paint.gray(' window ended');
+  else if (row.projected) reset = paint.gray(`${reset} (was reset)`);
+  const p = row.percent == null ? paint.gray('n/a') : (muted ? paint.dim(pct(row.percent)) : pct(row.percent));
+  return `${paint.dim(row.label.padEnd(8))} ${usageBar(row.percent, 18, muted)} ${p}${reset}`;
 }
 
 function accountStatus(rows) {
@@ -270,31 +404,35 @@ function accountStatus(rows) {
   if (!ps.length) return paint.gray('unknown');
   if (ps.some(p => p >= 100)) return paint.red('exhausted');
   if (rows.some(r => r.severity === 'critical') || ps.some(p => p >= 90)) return paint.yellow('near limit');
-  return paint.green('active');
+  return paint.green('ok');
+}
+
+function cardList(state) {
+  const others = listAccounts().filter(r => r.email !== state.account.email);
+  return [{ email: state.account.email, active: true }, ...others.map(r => ({ email: r.email, active: false, rec: r }))];
 }
 
 function render(state, now) {
   const L = [];
-  const acct = state.account;
-  const tier = (state.cred.rateLimitTier || '').replace(/^default_claude_/, '').replace('_', ' ');
-  const sub = state.cred.subscriptionType || '';
-  const plan = tier.startsWith(sub) ? tier : [sub, tier].filter(Boolean).join(' ');
+  const cards = cardList(state);
+  if (state.sel >= cards.length) state.sel = cards.length - 1;
+  const cursor = i => (!ONCE && i === state.sel ? paint.cyan('>') : ' ');
 
   L.push(paint.bold('agent-usage'));
-  L.push(`${paint.dim('Account'.padEnd(12))} ${paint.cyan(acct.email || 'unknown')}${plan ? paint.dim(` (${plan})`) : ''}`);
-  const tokExp = state.cred.expiresAt ? Date.parse(state.cred.expiresAt) || Number(state.cred.expiresAt) : null;
-  if (tokExp && tokExp <= now) {
-    L.push(`${paint.dim('Token'.padEnd(12))} ${paint.red('expired — run `claude` to refresh')}`);
-  }
   L.push('');
 
+  // ── active account ──
+  const acct = state.account;
+  const plan = planLabel(state.cred);
   const u = state.usage;
   const limited = state.error && /429/.test(state.error);
   const stale = u && state.error && state.usageAt ? paint.dim(` (cached ${fmtDur(now - state.usageAt)} ago)`) : '';
   const status = (u ? accountStatus(u.rows) : (limited ? paint.yellow('rate limited') : state.error ? paint.red('error') : paint.gray('probing…'))) + stale;
-  L.push(`${paint.cyan('>')} ${paint.bold('Claude Code')} ${paint.dim('(oauth)')} ${status}`);
+  L.push(`${cursor(0)} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))}${plan ? paint.dim(` (${plan})`) : ''} ${paint.dim('· logged in ·')} ${status}`);
+  const tokExp = state.cred.expiresAt ? Date.parse(state.cred.expiresAt) || Number(state.cred.expiresAt) : null;
+  if (tokExp && tokExp <= now) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.red('expired — run `claude` to refresh')}`);
   if (u) {
-    for (const row of u.rows) L.push(`  ${quotaLine(row, now)}`);
+    for (const row of projectRows(u.rows, now)) L.push(`  ${quotaLine(row, now)}`);
     const ex = u.extra;
     L.push(`  ${paint.dim('Extra'.padEnd(8))} ${ex.enabled ? `${pct(ex.percent)}${ex.limit != null ? paint.dim(` of ${ex.limit}`) : ''}` : paint.gray('off')}`);
   } else {
@@ -306,18 +444,90 @@ function render(state, now) {
   }
   if (limited) L.push(`  ${paint.dim(`rate limited — retrying in ${fmtDur(Math.max(0, (state.backoffUntil || 0) - now))}`)}`);
   else if (state.error) L.push(`  ${paint.red('probe error:')} ${state.error}`);
-  if (!ONCE) { L.push(''); L.push(paint.dim(`probe every ${fmtDur(INTERVAL_MS)} · r probe now · q quit`)); }
+
+  // ── archived accounts ──
+  cards.slice(1).forEach((c, k) => {
+    const i = k + 1;
+    const rec = c.rec;
+    const o = state.others.get(c.email) || {};
+    const exp = Number(rec.oauth?.expiresAt) || 0;
+    const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
+    let src;
+    if (o.authDead || (rexp && rexp < now)) src = paint.red('needs claude /login');
+    else if (o.live) src = paint.green('live');
+    else src = paint.gray(exp > now ? 'last known' : 'last known · token expired');
+    const seen = rec.seenAt ? paint.dim(`last seen ${fmtDur(now - rec.seenAt)} ago`) : '';
+    const plan2 = planLabel(rec.oauth);
+    L.push('');
+    L.push(`${cursor(i)} ${paint.gray('○')} ${paint.dim(c.email)}${plan2 ? paint.dim(` (${plan2})`) : ''} ${paint.dim('·')} ${seen} ${paint.dim('·')} ${src}`);
+    const nu = rec.usage ? normalize(rec.usage) : null;
+    if (nu) {
+      for (const row of projectRows(nu.rows, now)) L.push(`  ${quotaLine(row, now, true)}`);
+      if (rec.usageAt && !o.live) L.push(`  ${paint.dim('Data'.padEnd(8))} ${paint.dim(`from ${fmtDur(now - rec.usageAt)} ago`)}`);
+    } else {
+      for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now, true)}`);
+    }
+    if (o.error && !o.authDead) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
+  });
+
+  if (!ONCE) {
+    L.push('');
+    if (state.msg && now - state.msgAt < MSG_TTL_MS) L.push(state.msg);
+    L.push(paint.dim(`probe every ${fmtDur(INTERVAL_MS)} · ↑↓ select · enter switch · r probe now · q quit`));
+  }
   return L.join('\n');
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 async function main() {
+  if (has('--accounts')) {
+    const cur = loadAccount().email;
+    const list = listAccounts();
+    if (!list.length) { console.log('no archived accounts yet — run agent-usage while logged in and they get archived automatically'); return; }
+    const now = Date.now();
+    for (const r of list) {
+      const exp = Number(r.oauth?.expiresAt) || 0, rexp = Number(r.oauth?.refreshTokenExpiresAt) || 0;
+      console.log(`${r.email === cur ? '*' : ' '} ${r.email.padEnd(28)} ${planLabel(r.oauth).padEnd(10)} seen ${fmtDur(now - (r.seenAt || 0)).padEnd(6)} ago  token ${exp > now ? `valid ${fmtDur(exp - now)}` : 'expired'}  refresh ${rexp ? (rexp > now ? `valid ${fmtDur(rexp - now)}` : 'EXPIRED') : '?'}`);
+    }
+    return;
+  }
+  if (has('--forget')) {
+    const email = opt('--forget'); if (!email) throw new Error('--forget needs an email');
+    console.log(forgetAccount(email) ? `forgot ${email}` : `${email}: nothing archived`); return;
+  }
+  if (has('--switch')) {
+    const email = opt('--switch'); if (!email) throw new Error('--switch needs an email');
+    const r = switchTo(email);
+    console.log(r.already ? `${email} is already the logged-in account` : `switched Claude Code to ${email}${r.running ? ` — ${r.running} running claude session(s) keep their old account until restarted` : ''}`);
+    return;
+  }
+
   const cred = loadCredentials();
   const state = {
     cred, account: loadAccount(), usage: null, error: null,
     probing: false, lastProbeAt: null, lastProbeMs: 0, nextProbeAt: null,
     startedAt: Date.now(), local: { req: 0, tok: 0, last: null }, backoffMs: 0,
+    others: new Map(), sel: 0, msg: null, msgAt: 0,
   };
+
+  async function probeOther(rec, force) {
+    const now = Date.now();
+    const o = state.others.get(rec.email) || { live: false, error: null, backoffUntil: 0, backoffMs: 0, authDead: false };
+    const exp = Number(rec.oauth?.expiresAt) || 0;
+    if (rec.oauth?.accessToken && exp > now && !o.authDead && (force || now >= o.backoffUntil)) {
+      const r = await fetchUsage(rec.oauth.accessToken);
+      if (r.error) {
+        o.live = false; o.error = r.error;
+        if (r.status === 401 || r.status === 403) o.authDead = true;
+        else if (r.status === 429) { o.backoffMs = Math.max(r.retryAfterMs || 0, Math.min((o.backoffMs || MIN_BACKOFF_MS / 2) * 2, MAX_BACKOFF_MS)); o.backoffUntil = now + o.backoffMs; }
+        else o.backoffUntil = now + MIN_BACKOFF_MS;
+      } else {
+        o.live = true; o.error = null; o.backoffMs = 0; o.backoffUntil = 0;
+        archiveUsage(rec.email, r.data, r.fetchedAt);
+      }
+    } else if (!(exp > now)) o.live = false;
+    state.others.set(rec.email, o);
+  }
 
   async function probe(force = false) {
     if (state.probing) return;
@@ -326,14 +536,15 @@ async function main() {
     // is picked up without restarting.
     try { state.cred = loadCredentials(); } catch { /* keep last known */ }
     state.account = loadAccount();
+    try { archiveActive(state.cred, state.account); } catch { /* best effort */ }
     const t0 = Date.now();
     // Prefer a fresh shared cache (statusline or another agent-usage may have
     // just fetched). Only hit the network when it is stale or missing.
-    const cached = force ? null : readCache();
+    const cached = force ? null : readCache(state.account.email);
     let r;
     if (cached && t0 - cached.fetchedAt < CACHE_TTL_MS) r = cached;
     else if (!force && cached && state.backoffMs && t0 < (state.backoffUntil || 0)) r = cached; // still backing off: show stale
-    else r = await fetchUsage(state.cred.accessToken);
+    else r = await fetchUsage(state.cred.accessToken, { cacheAs: state.account.email });
     state.lastProbeMs = Date.now() - t0;
     state.lastProbeAt = Date.now();
     state.nextProbeAt = state.lastProbeAt + INTERVAL_MS;
@@ -344,9 +555,11 @@ async function main() {
         state.backoffUntil = Date.now() + state.backoffMs;
         try { writeFileSync(FAIL_FILE, ''); } catch { /* best effort */ }
       }
-      // Fall back to whatever the last good response was (ours or statusline's).
-      const stale = readCache();
+      // Fall back to whatever the last good response was (ours, statusline's, or the archive).
+      const stale = readCache(state.account.email);
+      const arch = state.account.email ? readAccount(state.account.email) : null;
       if (stale) { state.usage = normalize(stale.data); state.usageAt = stale.fetchedAt; }
+      else if (arch?.usage) { state.usage = normalize(arch.usage); state.usageAt = arch.usageAt; }
       if (JSON_OUT) { console.error(r.error); process.exit(1); }
     }
     else {
@@ -355,6 +568,11 @@ async function main() {
       if (JSON_OUT) { console.log(JSON.stringify(r.data, null, 2)); process.exit(0); }
       state.usage = normalize(r.data);
       state.usageAt = r.fetchedAt;
+      if (state.account.email) { try { archiveUsage(state.account.email, r.data, r.fetchedAt); } catch { /* best effort */ } }
+    }
+    for (const rec of listAccounts()) {
+      if (rec.email === state.account.email) continue;
+      try { await probeOther(rec, force); } catch (e) { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: e.message }); }
     }
     if (!NO_LOCAL) {
       const resets = state.usage?.sessionResetsAt ? Date.parse(state.usage.sessionResetsAt) : null;
@@ -385,11 +603,30 @@ async function main() {
     lastFrame = frame;
     out.write(`${ESC}H${ESC}2J${frame}\n`);
   };
+  const say = (m) => { state.msg = m; state.msgAt = Date.now(); };
+
+  function doSwitch() {
+    const cards = cardList(state);
+    const c = cards[state.sel];
+    if (!c || c.active) { say(paint.dim('already the logged-in account')); return; }
+    try {
+      const r = switchTo(c.email);
+      say(`${paint.green('switched to')} ${paint.cyan(c.email)}${r.running ? paint.yellow(` — ${r.running} running claude session(s) keep the old account until restarted`) : ''}`);
+      state.sel = 0;
+      state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0;
+      probe(true).then(draw);
+    } catch (e) { say(`${paint.red('switch failed:')} ${e.message.split('\n')[0]}`); }
+  }
+
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.setEncoding('utf8');
     process.stdin.on('data', k => {
       if (k === 'q' || k === '\x03') process.exit(0); // q or Ctrl-C
-      if (k === 'r') probe(true).then(draw);
+      else if (k === 'r') probe(true).then(draw);
+      else if (k === '\x1b[A' || k === 'k') state.sel = Math.max(0, state.sel - 1);
+      else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(cardList(state).length - 1, state.sel + 1);
+      else if (k === '\r' || k === '\n') doSwitch();
+      draw();
     });
   }
 
