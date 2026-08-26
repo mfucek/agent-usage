@@ -20,6 +20,9 @@ import {
   writeFileSync, renameSync, unlinkSync, mkdirSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { createServer } from 'node:http';
+import { createHash, randomBytes } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -43,8 +46,10 @@ accounts (archived under ~/.local/state/agent-usage/accounts/):
   --accounts       list archived accounts and exit
   --switch EMAIL   make EMAIL the logged-in Claude Code account and exit
   --forget EMAIL   delete EMAIL's archived tokens/usage and exit
+  --login          log in via the browser (PKCE, like \`claude /login\`), archive
+                   the account, make it the logged-in one, and exit
 
-live keys: ↑/↓ select account · enter switch · r probe now · q quit`);
+live keys: ↑/↓ select account · enter switch · l login in browser · r probe now · q quit`);
   process.exit(0);
 }
 
@@ -56,6 +61,12 @@ const COLOR = !has('--no-color') && !!process.stdout.isTTY && !process.env.NO_CO
 
 const HOME = homedir();
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// Same OAuth client Claude Code uses (see its TOKEN_URL / CLIENT_ID constants).
+const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
+const AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize';
+const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_SCOPES = ['org:create_api_key', 'user:profile', 'user:inference', 'user:file_upload', 'user:mcp_servers', 'user:sessions:claude_code'];
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 const CRED_FILE = join(HOME, '.claude', '.credentials.json');
 const CLAUDE_JSON = join(HOME, '.claude.json');
@@ -72,6 +83,14 @@ const FAIL_FILE = `${CACHE_FILE}.fail`; // statusline's negative-cache stamp
 const CACHE_TTL_MS = 120_000;
 const MIN_BACKOFF_MS = 5 * 60_000;
 const MAX_BACKOFF_MS = 30 * 60_000;
+// Archived (not logged-in) accounts: poll usage once an hour and refresh their
+// access token when it is within REFRESH_AHEAD_MS of expiring (or already
+// expired). A refresh rotates the refresh token, so it is only ever done for
+// tokens no running `claude` session can hold: archived accounts, or the
+// active account while no `claude` process is running.
+const OTHER_INTERVAL_MS = 60 * 60_000;
+const REFRESH_AHEAD_MS = 30 * 60_000;
+const REFRESH_RETRY_MS = 10 * 60_000;
 const FIVE_H = 5 * 3600 * 1000;
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 const MSG_TTL_MS = 60_000;
@@ -170,6 +189,20 @@ function writeKeychain(acct, value) {
   if (back !== value) throw new Error('keychain write did not round-trip');
 }
 
+// Replace claudeAiOauth in the Claude Code credential store (keychain or file),
+// keeping everything else in the blob (mcpOAuth ...).
+function writeCredentials(blob, oauth) {
+  const next = { ...(blob.json || {}), claudeAiOauth: oauth };
+  const serialized = JSON.stringify(next);
+  if (process.platform === 'darwin' && (blob.fromKeychain || !existsSync(CRED_FILE))) writeKeychain(blob.acct, serialized);
+  else { const tmp = `${CRED_FILE}.${process.pid}`; writeFileSync(tmp, serialized, { mode: 0o600 }); renameSync(tmp, CRED_FILE); }
+}
+function writeOauthAccount(oauthAccount) {
+  let cj = {}; try { cj = JSON.parse(readFileSync(CLAUDE_JSON, 'utf8')); } catch { /* fresh */ }
+  cj.oauthAccount = oauthAccount;
+  const tmp = `${CLAUDE_JSON}.${process.pid}`; writeFileSync(tmp, JSON.stringify(cj, null, 2)); renameSync(tmp, CLAUDE_JSON);
+}
+
 function switchTo(email) {
   const rec = readAccount(email);
   if (!rec?.oauth?.accessToken) throw new Error(`no archived tokens for ${email} — log in once with \`claude /login\` while agent-usage runs`);
@@ -183,18 +216,102 @@ function switchTo(email) {
   if (blob.json?.claudeAiOauth?.accessToken && cur.email) archiveActive(blob.json.claudeAiOauth, cur);
   if (cur.email === email) return { already: true, running: countClaudeProcs() };
 
-  const next = { ...(blob.json || {}), claudeAiOauth: rec.oauth };
-  const serialized = JSON.stringify(next);
-  if (process.platform === 'darwin' && (blob.fromKeychain || !existsSync(CRED_FILE))) writeKeychain(blob.acct, serialized);
-  else { const tmp = `${CRED_FILE}.${process.pid}`; writeFileSync(tmp, serialized, { mode: 0o600 }); renameSync(tmp, CRED_FILE); }
-
-  if (rec.oauthAccount) {
-    let cj = {}; try { cj = JSON.parse(readFileSync(CLAUDE_JSON, 'utf8')); } catch { /* fresh */ }
-    cj.oauthAccount = rec.oauthAccount;
-    const tmp = `${CLAUDE_JSON}.${process.pid}`; writeFileSync(tmp, JSON.stringify(cj, null, 2)); renameSync(tmp, CLAUDE_JSON);
-  }
+  writeCredentials(blob, rec.oauth);
+  if (rec.oauthAccount) writeOauthAccount(rec.oauthAccount);
   for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } }
   return { already: false, running: countClaudeProcs() };
+}
+
+// ─── Browser login (PKCE, same flow as `claude /login`) ─────────────────────
+const LOGIN_PORT = 54545;
+const b64url = b => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+function openBrowser(url) {
+  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
+  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  try { spawn(cmd, args, { stdio: 'ignore', detached: true }).unref(); return true; } catch { return false; }
+}
+
+// Runs the whole flow: local callback listener -> browser -> code exchange ->
+// profile lookup. Resolves { oauth, account } (account = oauthAccount shape).
+// `onStatus(msg)` receives progress lines. Rejects on failure/timeout.
+async function browserLogin({ onStatus = () => {}, timeoutMs = 5 * 60_000 } = {}) {
+  const verifier = b64url(randomBytes(32));
+  const challenge = b64url(createHash('sha256').update(verifier).digest());
+  const stateNonce = b64url(randomBytes(32));
+  const redirectUri = `http://localhost:${LOGIN_PORT}/callback`;
+
+  const code = await new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (err, val) => { if (done) return; done = true; clearTimeout(timer); server.close(); err ? reject(err) : resolve(val); };
+    const server = createServer((req, res) => {
+      const u = new URL(req.url, redirectUri);
+      if (u.pathname !== '/callback') { res.writeHead(404); res.end(); return; }
+      const err = u.searchParams.get('error');
+      const c = u.searchParams.get('code'), st = u.searchParams.get('state');
+      const ok = !err && c && st === stateNonce;
+      res.writeHead(ok ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><meta charset=utf-8><body style="font:16px system-ui;padding:2em">${ok ? 'agent-usage: login complete, you can close this tab.' : `agent-usage: login failed (${err || 'bad state'}).`}</body>`);
+      if (ok) finish(null, c); else finish(new Error(err ? `authorization denied: ${err}` : 'state mismatch in callback'));
+    });
+    const timer = setTimeout(() => finish(new Error('login timed out (5 min)')), timeoutMs);
+    server.on('error', e => finish(new Error(e.code === 'EADDRINUSE' ? `port ${LOGIN_PORT} busy (another login running?)` : e.message)));
+    server.listen(LOGIN_PORT, '127.0.0.1', () => {
+      const url = new URL(AUTHORIZE_URL);
+      for (const [k, v] of Object.entries({
+        code: 'true', client_id: OAUTH_CLIENT_ID, response_type: 'code', redirect_uri: redirectUri,
+        scope: OAUTH_SCOPES.join(' '), code_challenge: challenge, code_challenge_method: 'S256', state: stateNonce,
+      })) url.searchParams.set(k, v);
+      const opened = openBrowser(url.toString());
+      onStatus(opened ? 'browser opened — finish login there' : `open this URL to log in: ${url}`);
+    });
+  });
+
+  onStatus('exchanging code…');
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'agent-usage/1.2' },
+    body: JSON.stringify({ grant_type: 'authorization_code', code, state: stateNonce, redirect_uri: redirectUri, client_id: OAUTH_CLIENT_ID, code_verifier: verifier }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`token exchange HTTP ${res.status}: ${body?.error_description || body?.error?.message || body?.error || ''}`);
+  const oauth = tokenResponseToOauth(body, {});
+
+  // Identity, so the account can be archived / written to ~/.claude.json.
+  const pr = await fetch(PROFILE_URL, { headers: { Authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', Accept: 'application/json', 'User-Agent': 'agent-usage/1.2' } });
+  const prof = await pr.json().catch(() => ({}));
+  if (!pr.ok) throw new Error(`profile HTTP ${pr.status}`);
+  const a = prof.account || {}, org = prof.organization || {};
+  if (!a.email_address) throw new Error('profile response had no email');
+  const account = {
+    accountUuid: a.uuid, emailAddress: a.email_address, displayName: a.display_name || a.full_name || undefined, fullName: a.full_name || undefined,
+    organizationUuid: org.uuid, organizationName: org.name, organizationType: org.organization_type, organizationRole: org.role || undefined,
+    billingType: org.billing_type || undefined, hasExtraUsageEnabled: a.has_extra_usage_enabled ?? org.has_extra_usage_enabled ?? undefined,
+    organizationRateLimitTier: org.rate_limit_tier || undefined, userRateLimitTier: a.rate_limit_tier || undefined, profileFetchedAt: Date.now(),
+  };
+  for (const k of Object.keys(account)) if (account[k] === undefined) delete account[k];
+  if (!oauth.subscriptionType && (org.subscription_type || a.subscription_type)) oauth.subscriptionType = org.subscription_type || a.subscription_type;
+  if (!oauth.rateLimitTier && (org.rate_limit_tier || a.rate_limit_tier)) oauth.rateLimitTier = org.rate_limit_tier || a.rate_limit_tier;
+  return { oauth, account, profile: prof };
+}
+
+// Store a fresh login: always archive; make it the logged-in account when
+// `activate` (or when nobody is logged in). Returns a summary string.
+function storeLogin({ oauth, account }, { activate }) {
+  const email = account.emailAddress;
+  const rec = readAccount(email) || { email };
+  rec.oauth = oauth; rec.oauthAccount = { ...(rec.oauthAccount || {}), ...account }; rec.seenAt = Date.now(); rec.savedAt = Date.now();
+  saveAccount(rec);
+  const blob = loadCredentialBlob();
+  const cur = loadAccount();
+  const nobody = !blob.json?.claudeAiOauth?.accessToken || !cur.email;
+  if (!activate && !nobody && cur.email !== email) return `logged in as ${email} (archived; enter to switch)`;
+  if (!nobody && cur.email && cur.email !== email) archiveActive(blob.json.claudeAiOauth, cur);
+  writeCredentials(blob, oauth);
+  writeOauthAccount(rec.oauthAccount);
+  for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } }
+  const running = countClaudeProcs();
+  return `logged in as ${email}${running ? ` — ${running} running claude session(s) keep their old tokens until restarted` : ''}`;
 }
 
 // ─── Probe ──────────────────────────────────────────────────────────────────
@@ -223,6 +340,49 @@ async function fetchUsage(accessToken, { cacheAs = null, timeoutMs = 10_000 } = 
   } catch (err) {
     return { error: err?.name === 'AbortError' ? 'probe timed out' : (err?.message || String(err)) };
   } finally { clearTimeout(t); }
+}
+
+// Exchange a refresh token for a new access token (+ rotated refresh token).
+// Returns a new claudeAiOauth-shaped object, or { error, status, dead }.
+// `dead` means the refresh token itself was rejected: only a browser login helps.
+async function refreshOauth(oauth, { timeoutMs = 15_000 } = {}) {
+  if (!oauth?.refreshToken) return { error: 'no refresh token', dead: true };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'agent-usage/1.2' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: OAUTH_CLIENT_ID, scope: (oauth.scopes || OAUTH_SCOPES).join(' ') }),
+      signal: ctrl.signal,
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = body?.error_description || body?.error?.message || body?.error || '';
+      const dead = res.status === 400 || res.status === 401 || res.status === 403;
+      return { error: `refresh HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status, dead };
+    }
+    return tokenResponseToOauth(body, oauth);
+  } catch (err) {
+    return { error: err?.name === 'AbortError' ? 'refresh timed out' : (err?.message || String(err)) };
+  } finally { clearTimeout(t); }
+}
+
+// Map a /v1/oauth/token response onto the claudeAiOauth blob shape Claude Code stores.
+function tokenResponseToOauth(body, prev = {}) {
+  const now = Date.now();
+  const out = {
+    ...prev,
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token || prev.refreshToken,
+    expiresAt: now + (Number(body.expires_in) || 8 * 3600) * 1000,
+    scopes: typeof body.scope === 'string' && body.scope ? body.scope.split(' ') : (prev.scopes || OAUTH_SCOPES),
+  };
+  if (body.refresh_token_expires_in) out.refreshTokenExpiresAt = now + Number(body.refresh_token_expires_in) * 1000;
+  else if (body.refresh_token && !prev.refreshTokenExpiresAt) delete out.refreshTokenExpiresAt;
+  if (body.account?.subscription_type || body.subscription_type) out.subscriptionType = body.account?.subscription_type || body.subscription_type;
+  if (body.account?.rate_limit_tier || body.rate_limit_tier) out.rateLimitTier = body.account?.rate_limit_tier || body.rate_limit_tier;
+  return out;
 }
 
 function readCache(email) {
@@ -430,7 +590,8 @@ function render(state, now) {
   const status = (u ? accountStatus(u.rows) : (limited ? paint.yellow('rate limited') : state.error ? paint.red('error') : paint.gray('probing…'))) + stale;
   L.push(`${cursor(0)} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))}${plan ? paint.dim(` (${plan})`) : ''} ${paint.dim('· logged in ·')} ${status}`);
   const tokExp = state.cred.expiresAt ? Date.parse(state.cred.expiresAt) || Number(state.cred.expiresAt) : null;
-  if (tokExp && tokExp <= now) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.red('expired — run `claude` to refresh')}`);
+  if (state.activeRefresh) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.yellow(state.activeRefresh)}`);
+  else if (tokExp && tokExp <= now) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.red('expired — press l to log in')}`);
   if (u) {
     for (const row of projectRows(u.rows, now)) L.push(`  ${quotaLine(row, now)}`);
     const ex = u.extra;
@@ -453,7 +614,7 @@ function render(state, now) {
     const exp = Number(rec.oauth?.expiresAt) || 0;
     const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
     let src;
-    if (o.authDead || (rexp && rexp < now)) src = paint.red('needs claude /login');
+    if (o.authDead || (rexp && rexp < now)) src = paint.red('needs login — press l');
     else if (o.live) src = paint.green('live');
     else src = paint.gray(exp > now ? 'last known' : 'last known · token expired');
     const seen = rec.seenAt ? paint.dim(`last seen ${fmtDur(now - rec.seenAt)} ago`) : '';
@@ -473,7 +634,7 @@ function render(state, now) {
   if (!ONCE) {
     L.push('');
     if (state.msg && now - state.msgAt < MSG_TTL_MS) L.push(state.msg);
-    L.push(paint.dim(`probe every ${fmtDur(INTERVAL_MS)} · ↑↓ select · enter switch · r probe now · q quit`));
+    L.push(paint.dim(`probe every ${fmtDur(INTERVAL_MS)} · ↑↓ select · enter switch · l login · r probe now · q quit`));
   }
   return L.join('\n');
 }
@@ -502,6 +663,12 @@ async function main() {
     return;
   }
 
+  if (has('--login')) {
+    const r = await browserLogin({ onStatus: m => console.error(m) });
+    console.log(storeLogin(r, { activate: true }));
+    return;
+  }
+
   const cred = loadCredentials();
   const state = {
     cred, account: loadAccount(), usage: null, error: null,
@@ -510,11 +677,45 @@ async function main() {
     others: new Map(), sel: 0, msg: null, msgAt: 0,
   };
 
+  // Refresh the logged-in account's token ourselves only when no `claude`
+  // process is running: a refresh rotates the refresh token, and a running
+  // session holding the old one would be forced to re-login.
+  async function maybeRefreshActive() {
+    const now = Date.now();
+    const exp = Number(state.cred?.expiresAt) || 0, rexp = Number(state.cred?.refreshTokenExpiresAt) || 0;
+    state.activeRefresh = null;
+    if (!state.cred?.refreshToken || exp - now >= REFRESH_AHEAD_MS || (rexp && rexp < now)) return;
+    if (now - (state.activeRefreshTriedAt || 0) < REFRESH_RETRY_MS) return;
+    const running = countClaudeProcs();
+    if (running) { state.activeRefresh = `token ${exp <= now ? 'expired' : 'expiring'} — ${running} claude session(s) running, leaving refresh to them`; return; }
+    state.activeRefreshTriedAt = now;
+    const r = await refreshOauth(state.cred);
+    if (r.error) { state.activeRefresh = r.error; return; }
+    try { writeCredentials(loadCredentialBlob(), r); state.cred = r; state.activeRefresh = null; }
+    catch (e) { state.activeRefresh = `refreshed but could not store: ${e.message.split('\n')[0]}`; }
+  }
+
   async function probeOther(rec, force) {
     const now = Date.now();
-    const o = state.others.get(rec.email) || { live: false, error: null, backoffUntil: 0, backoffMs: 0, authDead: false };
-    const exp = Number(rec.oauth?.expiresAt) || 0;
-    if (rec.oauth?.accessToken && exp > now && !o.authDead && (force || now >= o.backoffUntil)) {
+    const o = state.others.get(rec.email) || { live: false, error: null, backoffUntil: 0, backoffMs: 0, authDead: false, lastAt: 0, refreshTriedAt: 0, refreshError: null };
+    state.others.set(rec.email, o);
+    let exp = Number(rec.oauth?.expiresAt) || 0;
+    const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
+    // Keep the archived token alive: refresh when expired / about to expire.
+    if (rec.oauth?.refreshToken && !(rexp && rexp < now) && !o.authDead && exp - now < REFRESH_AHEAD_MS && (force || now - o.refreshTriedAt > REFRESH_RETRY_MS)) {
+      o.refreshTriedAt = now;
+      const r = await refreshOauth(rec.oauth);
+      if (r.error) { o.refreshError = r.error; if (r.dead) o.authDead = true; }
+      else {
+        o.refreshError = null;
+        const fresh = readAccount(rec.email) || rec;
+        fresh.oauth = r; fresh.seenAt = now; fresh.savedAt = now; saveAccount(fresh);
+        rec.oauth = r; exp = Number(r.expiresAt) || 0; o.live = false;
+      }
+    }
+    const due = force || now - o.lastAt >= OTHER_INTERVAL_MS;
+    if (rec.oauth?.accessToken && exp > now && !o.authDead && due && now >= o.backoffUntil) {
+      o.lastAt = now;
       const r = await fetchUsage(rec.oauth.accessToken);
       if (r.error) {
         o.live = false; o.error = r.error;
@@ -526,7 +727,6 @@ async function main() {
         archiveUsage(rec.email, r.data, r.fetchedAt);
       }
     } else if (!(exp > now)) o.live = false;
-    state.others.set(rec.email, o);
   }
 
   async function probe(force = false) {
@@ -536,6 +736,7 @@ async function main() {
     // is picked up without restarting.
     try { state.cred = loadCredentials(); } catch { /* keep last known */ }
     state.account = loadAccount();
+    await maybeRefreshActive();
     try { archiveActive(state.cred, state.account); } catch { /* best effort */ }
     const t0 = Date.now();
     // Prefer a fresh shared cache (statusline or another agent-usage may have
@@ -618,6 +819,26 @@ async function main() {
     } catch (e) { say(`${paint.red('switch failed:')} ${e.message.split('\n')[0]}`); }
   }
 
+  let loggingIn = false;
+  function doLogin() {
+    if (loggingIn) { say(paint.dim('login already in progress — finish it in the browser')); return; }
+    loggingIn = true;
+    const c = cardList(state)[state.sel];
+    say(paint.cyan('starting browser login…'));
+    browserLogin({ onStatus: m => { say(paint.cyan(m)); draw(); } })
+      .then(r => {
+        // Activate when the selected card is (or becomes) the logged-in account,
+        // or when the login is for the currently logged-in email.
+        const activate = !c || c.active || r.account.emailAddress === state.account.email || r.account.emailAddress === c.email;
+        say(paint.green(storeLogin(r, { activate })));
+        for (const [e, o] of state.others) if (e === r.account.emailAddress) state.others.set(e, { ...o, authDead: false, error: null, refreshError: null, backoffUntil: 0, backoffMs: 0, lastAt: 0 });
+        state.sel = 0; state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0; state.activeRefreshTriedAt = 0;
+        return probe(true);
+      })
+      .catch(e => say(`${paint.red('login failed:')} ${e.message.split('\n')[0]}`))
+      .finally(() => { loggingIn = false; draw(); });
+  }
+
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.setEncoding('utf8');
     process.stdin.on('data', k => {
@@ -626,6 +847,7 @@ async function main() {
       else if (k === '\x1b[A' || k === 'k') state.sel = Math.max(0, state.sel - 1);
       else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(cardList(state).length - 1, state.sel + 1);
       else if (k === '\r' || k === '\n') doSwitch();
+      else if (k === 'l') doLogin();
       draw();
     });
   }
