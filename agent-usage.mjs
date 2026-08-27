@@ -8,7 +8,7 @@
 //
 // Every account it ever sees logged in is archived (tokens + last usage) under
 // ~/.local/state/agent-usage/accounts/. Archived accounts render as gray cards
-// below the active one and can be switched into (↑/↓ + Enter): the archived
+// in a fixed order (ACCOUNT_ORDER, then newest-seen) and can be switched into (↑/↓ + Enter): the archived
 // OAuth blob is written back to the keychain + ~/.claude.json, so the next
 // `claude` you start runs as that account.
 //
@@ -73,6 +73,10 @@ const CLAUDE_JSON = join(HOME, '.claude.json');
 const PROJECTS_DIR = join(HOME, '.claude', 'projects');
 const STATE_DIR = join(HOME, '.local', 'state', 'agent-usage');
 const ACCOUNTS_DIR = join(STATE_DIR, 'accounts');
+// Fixed display order. Cards keep their slot no matter which account is logged
+// in; emails not listed here go after, newest-seen first.
+const ACCOUNT_ORDER = ['matijafucek1@gmail.com', 'lukafucek11@gmail.com', 'nino.malbasic@3topia.agency'];
+const orderRank = email => { const i = ACCOUNT_ORDER.indexOf(email); return i < 0 ? ACCOUNT_ORDER.length : i; };
 // Shared with ~/.claude/statusline-command.sh: whoever fetched last writes here,
 // everyone else reads. One request per CACHE_TTL across all tools/sessions —
 // the endpoint is aggressively rate limited (429, retry-after: 0) and a 429
@@ -157,7 +161,7 @@ function listAccounts() {
     if (!f.endsWith('.json')) continue;
     try { const r = JSON.parse(readFileSync(join(ACCOUNTS_DIR, f), 'utf8')); if (r?.email) out.push(r); } catch { /* skip */ }
   }
-  return out.sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0));
+  return out.sort((a, b) => orderRank(a.email) - orderRank(b.email) || (b.seenAt || 0) - (a.seenAt || 0));
 }
 function forgetAccount(email) { try { unlinkSync(accountFile(email)); return true; } catch { return false; } }
 
@@ -569,8 +573,11 @@ function accountStatus(rows) {
 
 function cardList(state) {
   const others = listAccounts().filter(r => r.email !== state.account.email);
-  return [{ email: state.account.email, active: true }, ...others.map(r => ({ email: r.email, active: false, rec: r }))];
+  const cards = [{ email: state.account.email, active: true }, ...others.map(r => ({ email: r.email, active: false, rec: r }))];
+  // Stable: listAccounts() is already ordered, and the active card slots in by rank.
+  return cards.sort((a, b) => orderRank(a.email) - orderRank(b.email) || (a.active ? -1 : b.active ? 1 : 0));
 }
+const activeIndex = cards => Math.max(0, cards.findIndex(c => c.active));
 
 function render(state, now) {
   const L = [];
@@ -579,16 +586,29 @@ function render(state, now) {
   const cursor = i => (!ONCE && i === state.sel ? paint.cyan('>') : ' ');
 
   L.push(paint.bold('agent-usage'));
-  L.push('');
 
-  // ── active account ──
+  cards.forEach((c, i) => {
+    L.push('');
+    if (c.active) renderActive(L, state, now, cursor(i));
+    else renderArchived(L, state, now, cursor(i), c);
+  });
+
+  if (!ONCE) {
+    L.push('');
+    if (state.msg && now - state.msgAt < MSG_TTL_MS) L.push(state.msg);
+    L.push(paint.dim(`probe every ${fmtDur(INTERVAL_MS)} · ↑↓ select · enter switch · l login · r probe now · q quit`));
+  }
+  return L.join('\n');
+}
+
+function renderActive(L, state, now, cur) {
   const acct = state.account;
   const plan = planLabel(state.cred);
   const u = state.usage;
   const limited = state.error && /429/.test(state.error);
   const stale = u && state.error && state.usageAt ? paint.dim(` (cached ${fmtDur(now - state.usageAt)} ago)`) : '';
   const status = (u ? accountStatus(u.rows) : (limited ? paint.yellow('rate limited') : state.error ? paint.red('error') : paint.gray('probing…'))) + stale;
-  L.push(`${cursor(0)} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))}${plan ? paint.dim(` (${plan})`) : ''} ${paint.dim('· logged in ·')} ${status}`);
+  L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))}${plan ? paint.dim(` (${plan})`) : ''} ${paint.dim('· logged in ·')} ${status}`);
   const tokExp = state.cred.expiresAt ? Date.parse(state.cred.expiresAt) || Number(state.cred.expiresAt) : null;
   if (state.activeRefresh) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.yellow(state.activeRefresh)}`);
   else if (tokExp && tokExp <= now) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.red('expired — press l to log in')}`);
@@ -605,38 +625,28 @@ function render(state, now) {
   }
   if (limited) L.push(`  ${paint.dim(`rate limited — retrying in ${fmtDur(Math.max(0, (state.backoffUntil || 0) - now))}`)}`);
   else if (state.error) L.push(`  ${paint.red('probe error:')} ${state.error}`);
+}
 
-  // ── archived accounts ──
-  cards.slice(1).forEach((c, k) => {
-    const i = k + 1;
-    const rec = c.rec;
-    const o = state.others.get(c.email) || {};
-    const exp = Number(rec.oauth?.expiresAt) || 0;
-    const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
-    let src;
-    if (o.authDead || (rexp && rexp < now)) src = paint.red('needs login — press l');
-    else if (o.live) src = paint.green('live');
-    else src = paint.gray(exp > now ? 'last known' : 'last known · token expired');
-    const seen = rec.seenAt ? paint.dim(`last seen ${fmtDur(now - rec.seenAt)} ago`) : '';
-    const plan2 = planLabel(rec.oauth);
-    L.push('');
-    L.push(`${cursor(i)} ${paint.gray('○')} ${paint.dim(c.email)}${plan2 ? paint.dim(` (${plan2})`) : ''} ${paint.dim('·')} ${seen} ${paint.dim('·')} ${src}`);
-    const nu = rec.usage ? normalize(rec.usage) : null;
-    if (nu) {
-      for (const row of projectRows(nu.rows, now)) L.push(`  ${quotaLine(row, now, true)}`);
-      if (rec.usageAt && !o.live) L.push(`  ${paint.dim('Data'.padEnd(8))} ${paint.dim(`from ${fmtDur(now - rec.usageAt)} ago`)}`);
-    } else {
-      for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now, true)}`);
-    }
-    if (o.error && !o.authDead) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
-  });
-
-  if (!ONCE) {
-    L.push('');
-    if (state.msg && now - state.msgAt < MSG_TTL_MS) L.push(state.msg);
-    L.push(paint.dim(`probe every ${fmtDur(INTERVAL_MS)} · ↑↓ select · enter switch · l login · r probe now · q quit`));
+function renderArchived(L, state, now, cur, c) {
+  const rec = c.rec;
+  const o = state.others.get(c.email) || {};
+  const exp = Number(rec.oauth?.expiresAt) || 0;
+  const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
+  let src;
+  if (o.authDead || (rexp && rexp < now)) src = paint.red('needs login — press l');
+  else if (o.live) src = paint.green('live');
+  else src = paint.gray(exp > now ? 'last known' : 'last known · token expired');
+  const seen = rec.seenAt ? paint.dim(`last seen ${fmtDur(now - rec.seenAt)} ago`) : '';
+  const plan2 = planLabel(rec.oauth);
+  L.push(`${cur} ${paint.gray('○')} ${paint.dim(c.email)}${plan2 ? paint.dim(` (${plan2})`) : ''} ${paint.dim('·')} ${seen} ${paint.dim('·')} ${src}`);
+  const nu = rec.usage ? normalize(rec.usage) : null;
+  if (nu) {
+    for (const row of projectRows(nu.rows, now)) L.push(`  ${quotaLine(row, now, true)}`);
+    if (rec.usageAt && !o.live) L.push(`  ${paint.dim('Data'.padEnd(8))} ${paint.dim(`from ${fmtDur(now - rec.usageAt)} ago`)}`);
+  } else {
+    for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now, true)}`);
   }
-  return L.join('\n');
+  if (o.error && !o.authDead) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -676,6 +686,7 @@ async function main() {
     startedAt: Date.now(), local: { req: 0, tok: 0, last: null }, backoffMs: 0,
     others: new Map(), sel: 0, msg: null, msgAt: 0,
   };
+  state.sel = activeIndex(cardList(state));
 
   // Refresh the logged-in account's token ourselves only when no `claude`
   // process is running: a refresh rotates the refresh token, and a running
@@ -813,7 +824,6 @@ async function main() {
     try {
       const r = switchTo(c.email);
       say(`${paint.green('switched to')} ${paint.cyan(c.email)}${r.running ? paint.yellow(` — ${r.running} running claude session(s) keep the old account until restarted`) : ''}`);
-      state.sel = 0;
       state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0;
       probe(true).then(draw);
     } catch (e) { say(`${paint.red('switch failed:')} ${e.message.split('\n')[0]}`); }
@@ -832,8 +842,8 @@ async function main() {
         const activate = !c || c.active || r.account.emailAddress === state.account.email || r.account.emailAddress === c.email;
         say(paint.green(storeLogin(r, { activate })));
         for (const [e, o] of state.others) if (e === r.account.emailAddress) state.others.set(e, { ...o, authDead: false, error: null, refreshError: null, backoffUntil: 0, backoffMs: 0, lastAt: 0 });
-        state.sel = 0; state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0; state.activeRefreshTriedAt = 0;
-        return probe(true);
+        state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0; state.activeRefreshTriedAt = 0;
+        return probe(true).then(() => { state.sel = activeIndex(cardList(state)); });
       })
       .catch(e => say(`${paint.red('login failed:')} ${e.message.split('\n')[0]}`))
       .finally(() => { loggingIn = false; draw(); });
