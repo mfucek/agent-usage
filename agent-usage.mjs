@@ -4,8 +4,8 @@
 // Reads the Claude Code OAuth token from the macOS keychain, polls the
 // zero-spend usage endpoint (`/api/oauth/usage`) and renders a teamclaude-style
 // status panel. Local transcripts (~/.claude/projects) are scanned incrementally
-// to show requests/tokens in the current 5h session window, and running
-// `claude` processes are counted per account (see SWITCH_LOG).
+// to show requests/tokens in the current 5h session window (attributed per
+// account via SWITCH_LOG); running `claude` processes are counted live.
 //
 // Every account it ever sees logged in is archived (tokens + last usage) under
 // ~/.local/state/agent-usage/accounts/. Archived accounts render as gray cards
@@ -78,10 +78,9 @@ const ACCOUNTS_DIR = join(STATE_DIR, 'accounts');
 // in; emails not listed here go after, newest-seen first.
 const ACCOUNT_ORDER = ['matijafucek1@gmail.com', 'lukafucek11@gmail.com', 'nino.malbasic@3topia.agency'];
 const orderRank = email => { const i = ACCOUNT_ORDER.indexOf(email); return i < 0 ? ACCOUNT_ORDER.length : i; };
-// Append-only history of which account was logged in from when. A running
-// `claude` process keeps the account it started with, and transcripts carry no
-// account id, so sessions and local usage are attributed to the account that
-// was logged in at their start time / timestamp.
+// Append-only history of which account was logged in from when. Transcripts
+// carry no account id, so local usage is attributed to the account that was
+// logged in at each request's timestamp.
 const SWITCH_LOG = join(STATE_DIR, 'switch-log.jsonl');
 const PS_POLL_MS = 2000;
 // Shared with ~/.claude/statusline-command.sh: whoever fetched last writes here,
@@ -231,31 +230,21 @@ function accountAt(ts) {
   for (const e of log) { if (e.t <= ts) email = e.email; else break; }
   return email;
 }
-// Start times of running `claude` processes. ps etime is [[dd-]hh:]mm:ss.
-function listClaudeStarts(now) {
-  try {
-    const pids = execFileSync('pgrep', ['-x', 'claude'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n').filter(Boolean);
-    if (!pids.length) return [];
-    const out = execFileSync('ps', ['-o', 'etime=', '-p', pids.join(',')], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-    const starts = [];
-    for (const line of out.split('\n')) {
-      const m = line.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
-      if (!m) continue;
-      const secs = (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+m[3]) * 60 + (+m[4]);
-      starts.push(now - secs * 1000);
-    }
-    return starts;
-  } catch { return []; }
-}
-// email -> number of running claude sessions attributed to it.
-function sessionCounts(currentEmail, now = Date.now()) {
+// Running `claude` processes do not keep the account they started with: every
+// API request goes through getAnthropicClient() -> checkAndRefreshOAuthTokenIfNeeded()
+// -> invalidateOAuthCacheIfDiskChanged(), which re-reads the keychain (30s
+// cache, KEYCHAIN_CACHE_TTL_MS in src/utils/secureStorage/macOsKeychainHelpers.ts).
+// So after a switch every running session is on the new account by its next
+// request, at most CLAUDE_TOKEN_CACHE_MS later. All sessions therefore count
+// against the logged-in account.
+const CLAUDE_TOKEN_CACHE_MS = 30_000;
+function sessionCounts(currentEmail) {
   const counts = new Map();
-  for (const t of listClaudeStarts(now)) {
-    const email = accountAt(t) || currentEmail;
-    if (email) counts.set(email, (counts.get(email) || 0) + 1);
-  }
+  const n = countClaudeProcs();
+  if (currentEmail && n) counts.set(currentEmail, n);
   return counts;
 }
+function lastSwitchAt() { const log = loadSwitchLog(); return log.length ? log[log.length - 1].t : 0; }
 
 function writeKeychain(acct, value) {
   // NOTE: `security -i` (stdin) silently truncates lines at 4 KiB and the blob
@@ -390,7 +379,7 @@ function storeLogin({ oauth, account }, { activate }) {
   for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } }
   logActiveAccount(email);
   const running = countClaudeProcs();
-  return `logged in as ${email}${running ? ` — ${running} running claude session(s) keep their old tokens until restarted` : ''}`;
+  return `logged in as ${email}${running ? ` — ${running} running claude session(s) pick it up on their next request (≤30s)` : ''}`;
 }
 
 // ─── Probe ──────────────────────────────────────────────────────────────────
@@ -709,7 +698,8 @@ function extraLine(ex) {
 }
 function commonRows(L, state, email) {
   const n = state.sessions.get(email) || 0;
-  L.push(`  ${label('Claude')} ${n ? `${n} running session${n === 1 ? '' : 's'}` : paint.gray('no running sessions')}${paint.dim(' (local)')}`);
+  const handover = n && Date.now() - lastSwitchAt() < CLAUDE_TOKEN_CACHE_MS ? paint.yellow(` · picking up this account (≤${CLAUDE_TOKEN_CACHE_MS / 1000}s)`) : '';
+  L.push(`  ${label('Claude')} ${n ? `${n} running session${n === 1 ? '' : 's'}` : paint.gray('no running sessions')}${paint.dim(' (local)')}${handover}`);
   if (!NO_LOCAL) {
     const s = state.localBy.get(email) || { req: 0, tok: 0 };
     L.push(`  ${label('Usage')} ${s.req} req, ${fmtNum(s.tok)} tok${paint.dim(' (local, 5h window)')}`);
@@ -757,7 +747,7 @@ async function main() {
   if (has('--switch')) {
     const email = opt('--switch'); if (!email) throw new Error('--switch needs an email');
     const r = switchTo(email);
-    console.log(r.already ? `${email} is already the logged-in account` : `switched Claude Code to ${email}${r.running ? ` — ${r.running} running claude session(s) keep their old account until restarted` : ''}`);
+    console.log(r.already ? `${email} is already the logged-in account` : `switched Claude Code to ${email}${r.running ? ` — ${r.running} running claude session(s) pick it up on their next request (≤30s)` : ''}`);
     return;
   }
 
@@ -924,7 +914,7 @@ async function main() {
     if (!c || c.active) { say(paint.dim('already the logged-in account')); return; }
     try {
       const r = switchTo(c.email);
-      say(`${paint.green('switched to')} ${paint.cyan(c.email)}${r.running ? paint.yellow(` — ${r.running} running claude session(s) keep the old account until restarted`) : ''}`);
+      say(`${paint.green('switched to')} ${paint.cyan(c.email)}${r.running ? paint.yellow(` — ${r.running} running claude session(s) pick it up on their next request (≤30s)`) : ''}`);
       state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0;
       probe(true).then(draw);
     } catch (e) { say(`${paint.red('switch failed:')} ${e.message.split('\n')[0]}`); }
