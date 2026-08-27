@@ -4,7 +4,8 @@
 // Reads the Claude Code OAuth token from the macOS keychain, polls the
 // zero-spend usage endpoint (`/api/oauth/usage`) and renders a teamclaude-style
 // status panel. Local transcripts (~/.claude/projects) are scanned incrementally
-// to show requests/tokens in the current 5h session window.
+// to show requests/tokens in the current 5h session window, and running
+// `claude` processes are counted per account (see SWITCH_LOG).
 //
 // Every account it ever sees logged in is archived (tokens + last usage) under
 // ~/.local/state/agent-usage/accounts/. Archived accounts render as gray cards
@@ -17,7 +18,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   readFileSync, readdirSync, statSync, openSync, readSync, closeSync, existsSync,
-  writeFileSync, renameSync, unlinkSync, mkdirSync,
+  writeFileSync, renameSync, unlinkSync, mkdirSync, appendFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { createServer } from 'node:http';
@@ -77,6 +78,12 @@ const ACCOUNTS_DIR = join(STATE_DIR, 'accounts');
 // in; emails not listed here go after, newest-seen first.
 const ACCOUNT_ORDER = ['matijafucek1@gmail.com', 'lukafucek11@gmail.com', 'nino.malbasic@3topia.agency'];
 const orderRank = email => { const i = ACCOUNT_ORDER.indexOf(email); return i < 0 ? ACCOUNT_ORDER.length : i; };
+// Append-only history of which account was logged in from when. A running
+// `claude` process keeps the account it started with, and transcripts carry no
+// account id, so sessions and local usage are attributed to the account that
+// was logged in at their start time / timestamp.
+const SWITCH_LOG = join(STATE_DIR, 'switch-log.jsonl');
+const PS_POLL_MS = 2000;
 // Shared with ~/.claude/statusline-command.sh: whoever fetched last writes here,
 // everyone else reads. One request per CACHE_TTL across all tools/sessions —
 // the endpoint is aggressively rate limited (429, retry-after: 0) and a 429
@@ -184,6 +191,72 @@ function countClaudeProcs() {
   try { return execFileSync('pgrep', ['-x', 'claude'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n').filter(Boolean).length; } catch { return 0; }
 }
 
+// ─── Switch log + per-account attribution ───────────────────────────────────
+let switchLog = null; // [{ t, email }] ascending
+function loadSwitchLog() {
+  if (switchLog) return switchLog;
+  switchLog = [];
+  try {
+    for (const line of readFileSync(SWITCH_LOG, 'utf8').split('\n')) {
+      if (!line) continue;
+      try { const e = JSON.parse(line); if (e?.email && e?.t) switchLog.push(e); } catch { /* skip */ }
+    }
+  } catch {
+    // First run: reconstruct a rough history from the archive. Each account
+    // was logged in from the previous account's last-seen time until its own.
+    const seen = listAccounts().filter(r => r.seenAt).sort((a, b) => a.seenAt - b.seenAt);
+    seen.forEach((r, i) => switchLog.push({ t: i ? seen[i - 1].seenAt : 1, email: r.email }));
+    try { mkdirSync(STATE_DIR, { recursive: true }); writeFileSync(SWITCH_LOG, switchLog.map(x => JSON.stringify(x)).join('\n') + (switchLog.length ? '\n' : '')); } catch { /* best effort */ }
+  }
+  return switchLog;
+}
+// Record `email` as logged in from now, if that is a change.
+function logActiveAccount(email) {
+  if (!email) return;
+  const log = loadSwitchLog();
+  if (log.length && log[log.length - 1].email === email) return;
+  const e = { t: Date.now(), email };
+  log.push(e);
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    if (log.length > 500) { switchLog = log.slice(-200); writeFileSync(SWITCH_LOG, switchLog.map(x => JSON.stringify(x)).join('\n') + '\n'); }
+    else appendFileSync(SWITCH_LOG, JSON.stringify(e) + '\n');
+  } catch { /* best effort */ }
+}
+// Account logged in at time `ts` (best effort: before the first record we
+// assume the first recorded account).
+function accountAt(ts) {
+  const log = loadSwitchLog();
+  let email = log.length ? log[0].email : null;
+  for (const e of log) { if (e.t <= ts) email = e.email; else break; }
+  return email;
+}
+// Start times of running `claude` processes. ps etime is [[dd-]hh:]mm:ss.
+function listClaudeStarts(now) {
+  try {
+    const pids = execFileSync('pgrep', ['-x', 'claude'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n').filter(Boolean);
+    if (!pids.length) return [];
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', pids.join(',')], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    const starts = [];
+    for (const line of out.split('\n')) {
+      const m = line.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+      if (!m) continue;
+      const secs = (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+m[3]) * 60 + (+m[4]);
+      starts.push(now - secs * 1000);
+    }
+    return starts;
+  } catch { return []; }
+}
+// email -> number of running claude sessions attributed to it.
+function sessionCounts(currentEmail, now = Date.now()) {
+  const counts = new Map();
+  for (const t of listClaudeStarts(now)) {
+    const email = accountAt(t) || currentEmail;
+    if (email) counts.set(email, (counts.get(email) || 0) + 1);
+  }
+  return counts;
+}
+
 function writeKeychain(acct, value) {
   // NOTE: `security -i` (stdin) silently truncates lines at 4 KiB and the blob
   // is ~10-15 KiB, so the value has to go via argv (same as Claude Code does).
@@ -223,6 +296,7 @@ function switchTo(email) {
   writeCredentials(blob, rec.oauth);
   if (rec.oauthAccount) writeOauthAccount(rec.oauthAccount);
   for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } }
+  logActiveAccount(email);
   return { already: false, running: countClaudeProcs() };
 }
 
@@ -314,6 +388,7 @@ function storeLogin({ oauth, account }, { activate }) {
   writeCredentials(blob, oauth);
   writeOauthAccount(rec.oauthAccount);
   for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } }
+  logActiveAccount(email);
   const running = countClaudeProcs();
   return `logged in as ${email}${running ? ` — ${running} running claude session(s) keep their old tokens until restarted` : ''}`;
 }
@@ -507,10 +582,16 @@ function scanLocal(windowStart) {
 
 function safeReaddir(d) { try { return readdirSync(d); } catch { return []; } }
 
-function localSummary() {
-  let req = 0, tok = 0, last = 0;
-  for (const r of requests.values()) { req++; tok += r.tokens; if (r.ts > last) last = r.ts; }
-  return { req, tok, last: last || null };
+// email -> { req, tok, last }, each request attributed via the switch log.
+function localSummaryBy(currentEmail) {
+  const by = new Map();
+  for (const r of requests.values()) {
+    const email = accountAt(r.ts) || currentEmail || '?';
+    const s = by.get(email) || { req: 0, tok: 0, last: 0 };
+    s.req++; s.tok += r.tokens; if (r.ts > s.last) s.last = r.ts;
+    by.set(email, s);
+  }
+  return by;
 }
 
 // ─── Rendering ──────────────────────────────────────────────────────────────
@@ -612,19 +693,27 @@ function renderActive(L, state, now, cur) {
   const tokExp = state.cred.expiresAt ? Date.parse(state.cred.expiresAt) || Number(state.cred.expiresAt) : null;
   if (state.activeRefresh) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.yellow(state.activeRefresh)}`);
   else if (tokExp && tokExp <= now) L.push(`  ${paint.dim('Token'.padEnd(8))} ${paint.red('expired — press l to log in')}`);
-  if (u) {
-    for (const row of projectRows(u.rows, now)) L.push(`  ${quotaLine(row, now)}`);
-    const ex = u.extra;
-    L.push(`  ${paint.dim('Extra'.padEnd(8))} ${ex.enabled ? `${pct(ex.percent)}${ex.limit != null ? paint.dim(` of ${ex.limit}`) : ''}` : paint.gray('off')}`);
-  } else {
-    for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now)}`);
-  }
-  if (!NO_LOCAL) {
-    const s = state.local;
-    L.push(`  ${paint.dim('Usage'.padEnd(8))} ${s.req} req, ${fmtNum(s.tok)} tok${paint.dim(' (local, 5h window)')}`);
-  }
+  if (u) for (const row of projectRows(u.rows, now)) L.push(`  ${quotaLine(row, now)}`);
+  else for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now)}`);
+  L.push(extraLine(u?.extra));
+  commonRows(L, state, acct.email);
   if (limited) L.push(`  ${paint.dim(`rate limited — retrying in ${fmtDur(Math.max(0, (state.backoffUntil || 0) - now))}`)}`);
   else if (state.error) L.push(`  ${paint.red('probe error:')} ${state.error}`);
+}
+
+// Rows every card shows, logged in or not.
+const label = s => paint.dim(s.padEnd(8));
+function extraLine(ex) {
+  const v = !ex ? paint.gray('—') : ex.enabled ? `${pct(ex.percent)}${ex.limit != null ? paint.dim(` of ${ex.limit}`) : ''}` : paint.gray('off');
+  return `  ${label('Extra')} ${v}`;
+}
+function commonRows(L, state, email) {
+  const n = state.sessions.get(email) || 0;
+  L.push(`  ${label('Claude')} ${n ? `${n} running session${n === 1 ? '' : 's'}` : paint.gray('no running sessions')}${paint.dim(' (local)')}`);
+  if (!NO_LOCAL) {
+    const s = state.localBy.get(email) || { req: 0, tok: 0 };
+    L.push(`  ${label('Usage')} ${s.req} req, ${fmtNum(s.tok)} tok${paint.dim(' (local, 5h window)')}`);
+  }
 }
 
 function renderArchived(L, state, now, cur, c) {
@@ -640,12 +729,11 @@ function renderArchived(L, state, now, cur, c) {
   const plan2 = planLabel(rec.oauth);
   L.push(`${cur} ${paint.gray('○')} ${paint.dim(c.email)}${plan2 ? paint.dim(` (${plan2})`) : ''} ${paint.dim('·')} ${seen} ${paint.dim('·')} ${src}`);
   const nu = rec.usage ? normalize(rec.usage) : null;
-  if (nu) {
-    for (const row of projectRows(nu.rows, now)) L.push(`  ${quotaLine(row, now, true)}`);
-    if (rec.usageAt && !o.live) L.push(`  ${paint.dim('Data'.padEnd(8))} ${paint.dim(`from ${fmtDur(now - rec.usageAt)} ago`)}`);
-  } else {
-    for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now, true)}`);
-  }
+  if (nu) for (const row of projectRows(nu.rows, now)) L.push(`  ${quotaLine(row, now, true)}`);
+  else for (const label of ['Session', 'Weekly', 'Fable']) L.push(`  ${quotaLine({ label, percent: null }, now, true)}`);
+  L.push(extraLine(nu?.extra));
+  commonRows(L, state, c.email);
+  if (nu && rec.usageAt && !o.live) L.push(`  ${label('Data')} ${paint.dim(`from ${fmtDur(now - rec.usageAt)} ago`)}`);
   if (o.error && !o.authDead) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
 }
 
@@ -683,8 +771,19 @@ async function main() {
   const state = {
     cred, account: loadAccount(), usage: null, error: null,
     probing: false, lastProbeAt: null, lastProbeMs: 0, nextProbeAt: null,
-    startedAt: Date.now(), local: { req: 0, tok: 0, last: null }, backoffMs: 0,
+    startedAt: Date.now(), localBy: new Map(), sessions: new Map(), backoffMs: 0,
     others: new Map(), sel: 0, msg: null, msgAt: 0,
+  };
+  logActiveAccount(state.account.email);
+  // Realtime bits: running claude sessions per account, and a fast check for
+  // an out-of-band re-login (claude /login) so the switch log stays accurate.
+  let claudeJsonMtime = 0;
+  const pollSessions = () => {
+    try {
+      const mt = statSync(CLAUDE_JSON).mtimeMs;
+      if (mt !== claudeJsonMtime) { claudeJsonMtime = mt; state.account = loadAccount(); logActiveAccount(state.account.email); }
+    } catch { /* no ~/.claude.json */ }
+    state.sessions = sessionCounts(state.account.email);
   };
   state.sel = activeIndex(cardList(state));
 
@@ -747,6 +846,7 @@ async function main() {
     // is picked up without restarting.
     try { state.cred = loadCredentials(); } catch { /* keep last known */ }
     state.account = loadAccount();
+    logActiveAccount(state.account.email);
     await maybeRefreshActive();
     try { archiveActive(state.cred, state.account); } catch { /* best effort */ }
     const t0 = Date.now();
@@ -789,13 +889,14 @@ async function main() {
     if (!NO_LOCAL) {
       const resets = state.usage?.sessionResetsAt ? Date.parse(state.usage.sessionResetsAt) : null;
       const windowStart = resets && resets > Date.now() ? resets - FIVE_H : Date.now() - FIVE_H;
-      try { scanLocal(windowStart); state.local = localSummary(); } catch { /* best effort */ }
+      try { scanLocal(windowStart); state.localBy = localSummaryBy(state.account.email); } catch { /* best effort */ }
     }
     state.probing = false;
   }
 
   if (ONCE || JSON_OUT) {
     await probe();
+    pollSessions();
     process.stdout.write(render(state, Date.now()) + '\n');
     process.exit(state.error ? 1 : 0);
   }
@@ -867,9 +968,11 @@ async function main() {
     const delay = state.backoffMs || INTERVAL_MS;
     setTimeout(loop, delay).unref?.();
   });
+  pollSessions();
   loop();
   draw();
   setInterval(draw, 1000);
+  setInterval(pollSessions, PS_POLL_MS);
 }
 
 main().catch(err => { console.error(`agent-usage: ${err.message}`); process.exit(1); });
