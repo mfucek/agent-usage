@@ -1,60 +1,121 @@
 # agent-usage
 
-Live Claude (Max/Pro) quota in the terminal, teamclaude-style, for every account you log into. Zero dependencies, Node >= 18.
+Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress.
+
+Zero dependencies. Node ≥ 18. macOS keychain or `.credentials.json`.
 
 ```
 agent-usage
 
-> ● you@example.com (max 20x) · logged in · ok
-  Session  [███░░░░░░░░░░░░░░░] 18% reset 2h47m
-  Weekly   [██████░░░░░░░░░░░░] 34% reset 5d15h
-  Fable    [████████░░░░░░░░░░] 42% reset 5d15h
+  ○ matija@example.com (max 20x) · last seen 4h ago · live
+  Session  [██████████████████] 98% reset 1h2m
+  Weekly   [███░░░░░░░░░░░░░░░] 16% reset 6d7h
+  Fable    [███░░░░░░░░░░░░░░░] 16% reset 6d7h
   Extra    off
-  Claude   3 running sessions (local)
-  Usage    375 req, 4.2m tok (local, 5h window)
+  Claude   no running sessions (local)
+  Usage    0 req, 0 tok (local, 5h window)
 
-  ○ alt@example.com (max 5x) · last seen 6h ago · last known · token expired
+> ● luka@example.com (max 20x) · logged in · ok
+  Session  [████░░░░░░░░░░░░░░] 20% reset 2m
+  Weekly   [█░░░░░░░░░░░░░░░░░] 8% reset 5d17h
+  Fable    [███░░░░░░░░░░░░░░░] 14% reset 5d17h
+  Extra    off
+  Claude   7 running sessions (local)
+  Usage    428 req, 6.2m tok (local, 5h window)
+
+  ○ nino@example.com (max 20x) · last seen 1h ago · last known · token expired
   Session  [░░░░░░░░░░░░░░░░░░] 0% window ended
   Weekly   [█████████░░░░░░░░░] 50% reset 2d
   Fable    [░░░░░░░░░░░░░░░░░░] 0% reset 6d21h (was reset)
+  Extra    off
+  Claude   no running sessions (local)
+  Usage    0 req, 0 tok (local, 5h window)
   Data     from 5h ago
 
 probe every 1m · ↑↓ select · enter switch · l login · r probe now · q quit
 ```
 
-## Multiple accounts
+## Install
 
-- Every account seen logged in is archived under `~/.local/state/agent-usage/accounts/<email>.json` (mode 600): its `claudeAiOauth` tokens, `oauthAccount` identity and last usage response. Nothing to configure — log into the second account once with `claude /login` while agent-usage runs (or run `agent-usage --once` afterwards) and it appears.
-- Cards keep a fixed order (`ACCOUNT_ORDER` in the script, then any other account newest-seen first); the logged-in one is marked ● in place and does not jump to the top when you switch. Every card shows the same rows. `Claude` is the number of running `claude` processes on this machine, refreshed every 2s. They all count against the logged-in account: Claude Code re-reads the keychain before every API request (30s cache), so after a switch every running session is on the new account by its next request, ≤30s later — the row shows a yellow "picking up" note during that window. `Usage` is local transcript usage in the 5h window, attributed per account via `~/.local/state/agent-usage/switch-log.jsonl` (when each account became the logged-in one). Archived accounts render as gray cards. agent-usage keeps their access tokens alive itself: when one is within 30 min of expiring it is refreshed with the archived refresh token (rotated tokens are written back to the archive), and usage is polled once an hour. A card only falls back to "last known" if the refresh token is dead (`needs login — press l`). Reset moments are applied locally: a 5h window whose reset has passed renders empty ("window ended"); weekly/Fable buckets render empty and the countdown rolls forward 7 days ("was reset").
-- `↑/↓` + `Enter` (or `agent-usage --switch EMAIL`) makes that account the logged-in one: the archived `claudeAiOauth` replaces the one in the keychain (MCP tokens in the same blob are kept) and `~/.claude.json` `oauthAccount` is swapped. Only **new** `claude` sessions pick this up; running sessions keep their in-memory account and will write their own tokens back on their next refresh. The switch message shows how many `claude` processes are running.
-- Claude Code rotates refresh tokens; the archive re-copies the active account's tokens every probe, so it stays current as long as agent-usage sees that account logged in. If a switch fails with `needs claude /login`, log into that account once the normal way.
-- `agent-usage --accounts` lists the archive (token / refresh-token validity), `--forget EMAIL` deletes an entry.
+```sh
+git clone <this repo> ~/Documents/agent-tooling/agent-usage
+echo 'alias agent-usage="node ~/Documents/agent-tooling/agent-usage/bin/agent-usage.mjs"' >> ~/.zshrc
+# or: cd agent-usage && npm link
+```
 
-## How it works
+Optional: pin the card order in `~/.config/agent-usage/config.json`.
 
-- OAuth token comes from the macOS keychain (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json`. The logged-in account's token is refreshed by agent-usage only while **no** `claude` process is running (a refresh rotates the refresh token, and a running session holding the old one would be forced to re-login); otherwise the running sessions refresh it themselves and the card says so.
-- `l` (or `agent-usage --login`) runs the same browser PKCE login as `claude /login` (listener on `localhost:54545`, token endpoint `platform.claude.com/v1/oauth/token`). The account is archived; it also becomes the logged-in one when the selected card is the active account, matches the login email, or nobody is logged in — otherwise switch with Enter.
-- Quota comes from `GET https://api.anthropic.com/api/oauth/usage` — the same zero-spend endpoint Claude Code and teamclaude use. It never consumes message quota.
-- `Fable` always gets a dedicated row (from the `weekly_scoped` limit); other scoped buckets (Sonnet/Opus) appear automatically if the plan exposes them.
-- The endpoint is aggressively rate limited (HTTP 429, `retry-after: 0`, small sliding window per account). To stay under it, agent-usage and `~/.claude/statusline-command.sh` share one cache at `/tmp/.claude-usage-cache` (120s TTL): whoever fetched last writes, everyone else reads. agent-usage tags its writes with `_account` and ignores a cache belonging to another account; a switch deletes the cache. On 429 the last good response is shown with a `(cached Xm ago)` tag and the next network probe backs off 5→30 min (`r` forces a probe). The statusline also writes `/tmp/.claude-usage-cache.fail` and skips fetching for 5 min after any failure, so dozens of renders across sessions cannot keep the limit tripped.
-- The `Usage` row is computed locally from `~/.claude/projects/**/*.jsonl`: assistant messages in the current 5h session window, deduped by requestId. Tokens = input + cache-writes + output (cache reads excluded). Files are read incrementally (byte offsets), so only the first probe scans history.
+```json
+{ "order": ["matija@example.com", "luka@example.com"] }
+```
+
+Cards keep that order no matter which account is logged in; accounts not listed follow, newest-seen first.
 
 ## Usage
 
 ```
-agent-usage              # live: probe every 60s (r = probe now, q = quit)
-agent-usage -i 30        # probe every 30s (min 30)
-agent-usage --once       # print once and exit
-agent-usage --json       # raw endpoint JSON
-agent-usage --no-local   # skip the local transcript scan
-agent-usage --accounts   # list archived accounts
-agent-usage --switch EMAIL   # log Claude Code in as an archived account
+agent-usage                  # live: probe every 60s
+agent-usage -i 30            # probe every 30s (min 30)
+agent-usage --once           # print once and exit
+agent-usage --json           # raw endpoint JSON for the logged-in account
+agent-usage --no-local       # skip the local transcript scan (Usage row)
+agent-usage --no-color
+
+agent-usage --accounts       # list archived accounts (token / refresh validity)
+agent-usage --switch EMAIL   # make EMAIL the logged-in Claude Code account
 agent-usage --forget EMAIL   # drop an archived account
-agent-usage --login          # browser login, archive + activate the account
+agent-usage --login          # browser login (PKCE), archive + activate
 ```
 
-Aliased in `~/.zshrc`:
+Live keys: `↑/↓` (or `j/k`) select · `Enter` switch · `l` browser login · `r` probe now · `q` quit.
 
-```sh
-alias agent-usage="node ~/Documents/agent-tooling/agent-usage/agent-usage.mjs"
+## The rows
+
+Every card shows the same rows, logged in or not.
+
+| Row | Source |
+| --- | --- |
+| **Session / Weekly / Fable** | `GET api.anthropic.com/api/oauth/usage` — the zero-spend endpoint Claude Code itself uses. Fable always gets a row (from the `weekly_scoped` limit); other scoped buckets (Sonnet, Opus) appear when the plan exposes them. Reset moments are applied locally: a 5h window whose reset has passed renders empty ("window ended"); weekly buckets render empty and the countdown rolls forward 7 days ("was reset"). |
+| **Extra** | Extra-usage credits: off, or `%` of the monthly limit. |
+| **Claude** | Running `claude` processes on this machine, refreshed every 2s. All of them count against the logged-in account (see [Switching](#switching)). |
+| **Usage** | Local transcript usage in the current 5h window: assistant messages under `~/.claude/projects/**/*.jsonl`, deduped by `requestId`; tokens = input + cache writes + output (cache reads excluded). Attributed per account via the switch log. Files are read incrementally, so only the first probe scans history. |
+| **Data** | Archived cards only: age of the last usage response when it is not live. |
+
+Header: `●` logged in / `○` archived · plan · `ok` / `near limit` / `exhausted` · for archived cards `live`, `last known`, or `needs login — press l`.
+
+## Multiple accounts
+
+- Every account seen logged in is archived under `~/.local/state/agent-usage/accounts/<email>.json` (mode 600): its `claudeAiOauth` tokens, `oauthAccount` identity and last usage response. Nothing to configure — log into a second account with `claude /login` (or press `l`) while agent-usage runs and a card appears.
+- Archived tokens are kept alive: within 30 min of expiry the access token is refreshed with the archived refresh token (rotated tokens are written back), and usage is polled once an hour. A card only falls back to "last known" when the refresh token itself is dead.
+- The logged-in account's tokens are re-copied into the archive every probe, so a refresh performed by Claude Code (which rotates refresh tokens) is picked up within one interval. agent-usage refreshes the logged-in token itself only while no `claude` process is running; otherwise the sessions do it and the `Token` row says so.
+
+### Switching
+
+`Enter` (or `--switch EMAIL`) writes the archived `claudeAiOauth` into the keychain item `Claude Code-credentials` (the MCP tokens in the same blob are kept) and swaps `oauthAccount` in `~/.claude.json`.
+
+Running sessions follow. Claude Code re-reads the keychain before every API request (`getAnthropicClient` → `checkAndRefreshOAuthTokenIfNeeded` → `invalidateOAuthCacheIfDiskChanged`, through a 30s keychain cache), so every running `claude` is on the new account by its next request, at most 30s later — mid-turn, not at the end of it. A request already in flight finishes on the old account. During that window the `Claude` row shows `picking up this account (≤30s)`.
+
+`~/.local/state/agent-usage/switch-log.jsonl` records when each account became the logged-in one (also when the switch happened outside agent-usage — `~/.claude.json` is watched every 2s). Local `Usage` is attributed by request timestamp against that log. On first run the log is seeded from the archive's last-seen times, so history before that is approximate.
+
+## Rate limits and the shared cache
+
+The usage endpoint is aggressively rate limited (HTTP 429, `retry-after: 0`, small sliding window per account). agent-usage and `~/.claude/statusline-command.sh` share one cache at `/tmp/.claude-usage-cache` (120s TTL): whoever fetched last writes, everyone else reads. Writes are tagged with `_account` and a cache belonging to another account is ignored; a switch deletes it. On 429 the last good response is shown with `(cached Xm ago)` and the next network probe backs off 5 → 30 min (`r` forces one). `/tmp/.claude-usage-cache.fail` tells the statusline to skip fetching for 5 min after any failure.
+
+## Layout
+
 ```
+bin/agent-usage.mjs   entry
+src/cli.mjs           argv → opts, help text
+src/config.mjs        paths, endpoints, tunables, ~/.config/agent-usage/config.json
+src/credentials.mjs   keychain / .credentials.json blob, oauthAccount in .claude.json
+src/archive.mjs       per-account archive + switch log
+src/oauth.mjs         token refresh, browser PKCE login, profile
+src/switch.mjs        switchTo / storeLogin
+src/usage.mjs         usage endpoint, shared cache, normalisation
+src/local.mjs         running claude processes, transcript scan
+src/format.mjs        ANSI paint, bars, number/duration formatting
+src/render.mjs        the cards
+src/app.mjs           one-shot commands, probe loop, TUI
+```
+
+`npm run check` syntax-checks every module and runs one `--once` probe. Honors `CLAUDE_CONFIG_DIR` and `NO_COLOR`.

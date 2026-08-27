@@ -1,0 +1,15 @@
+{
+  "name": "agent-usage",
+  "version": "2.0.0",
+  "description": "Live Claude (Max/Pro) quota in the terminal, for every account you log into.",
+  "type": "module",
+  "bin": { "agent-usage": "bin/agent-usage.mjs" },
+  "files": ["bin", "src", "README.md"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node bin/agent-usage.mjs",
+    "check": "node --check bin/agent-usage.mjs && for f in src/*.mjs; do node --check \"$f\" || exit 1; done && node bin/agent-usage.mjs --once --no-color >/dev/null"
+  },
+  "license": "MIT",
+  "private": true
+}
