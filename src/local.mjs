@@ -5,13 +5,19 @@ import { join } from 'node:path';
 import { PROJECTS_DIR } from './config.mjs';
 import { accountAt, safeReaddir } from './archive.mjs';
 
-// Claude Code processes: comm is `claude` for the launcher, but the native
-// installer's versioned binary (~/.local/share/claude/versions/<v>) shows up
-// under its own path, so match both.
-const isClaudeProc = comm => comm === 'claude' || comm.endsWith('/claude') || /\/share\/claude\/versions\//.test(comm);
+// Claude Code processes. The launcher's comm is `claude`; the native
+// installer's versioned binary runs as ~/.local/share/claude/versions/<v>; an
+// npm install runs as `node .../bin/claude`. Look at the first two argv words.
+const CLAUDE_WORD = /(^|\/)claude$|\/share\/claude\/versions\//;
 export function countClaudeProcs() {
   try {
-    return execFileSync('ps', ['-Ao', 'comm='], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().split('\n').map(s => s.trim()).filter(isClaudeProc).length;
+    const out = execFileSync('ps', ['-Ao', 'args='], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    let n = 0;
+    for (const line of out.split('\n')) {
+      const [a0 = '', a1 = ''] = line.trim().split(/\s+/);
+      if (CLAUDE_WORD.test(a0) || (/(^|\/)(node|bun)$/.test(a0) && CLAUDE_WORD.test(a1))) n++;
+    }
+    return n;
   } catch { return 0; }
 }
 
@@ -46,7 +52,9 @@ export function scanLocal(windowStart) {
       const text = st.rest + buf.toString('utf8', 0, n);
       const lines = text.split('\n');
       st.rest = lines.pop() ?? '';
+      let k = 0;
       for (const line of lines) {
+        k++;
         if (!line.includes('"usage"')) continue;
         let j; try { j = JSON.parse(line); } catch { continue; }
         const u = j?.message?.usage;
@@ -54,7 +62,7 @@ export function scanLocal(windowStart) {
         if (j.message?.model === '<synthetic>') continue; // local placeholder, not an API call (Claude Code excludes these too)
         const ts = Date.parse(j.timestamp);
         if (!ts || ts < windowStart) continue;
-        const id = j.requestId || j.message?.id || j.uuid || `${p}:${ts}:${line.length}`;
+        const id = j.requestId || j.message?.id || j.uuid || `${p}:${st.offset}:${k}`;
         const tokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
         const prev = requests.get(id);
         requests.set(id, { ts, tokens: Math.max(prev?.tokens || 0, tokens) });

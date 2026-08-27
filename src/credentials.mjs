@@ -1,7 +1,7 @@
 // Claude Code's credential store (macOS keychain or .credentials.json) and the
 // `oauthAccount` identity in .claude.json.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { CLAUDE_JSON, CLAUDE_JSON_LOCK, CRED_FILE, KEYCHAIN_SERVICE } from './config.mjs';
 import { withLock } from './lock.mjs';
@@ -58,14 +58,20 @@ export function planLabel(oauth) {
 function writeKeychain(acct, value) {
   // `security -i` (stdin) silently truncates lines at 4 KiB and the blob is
   // ~10-15 KiB, so the value has to go via argv (same as Claude Code does).
-  execFileSync('security', ['add-generic-password', '-a', acct, '-s', KEYCHAIN_SERVICE, '-U', '-w', value], { stdio: ['ignore', 'ignore', 'pipe'] });
+  // The blob is in argv, so `security`'s failure text would contain the tokens:
+  // never let that Error escape, rethrow a scrubbed one.
+  try { execFileSync('security', ['add-generic-password', '-a', acct, '-s', KEYCHAIN_SERVICE, '-U', '-w', value], { stdio: ['ignore', 'ignore', 'pipe'] }); }
+  catch (e) { throw new Error(`keychain write failed (security exit ${e.status ?? '?'}): ${String(e.stderr || '').trim().split('\n')[0] || 'no detail'}`); }
   const back = execFileSync('security', ['find-generic-password', '-a', acct, '-s', KEYCHAIN_SERVICE, '-w'], quiet).toString().trim();
   if (back !== value) throw new Error('keychain write did not round-trip');
 }
 
+// Replace `path` atomically, keeping its existing mode (a user may have
+// tightened .claude.json to 0600 — it can hold MCP auth headers).
 function atomicWrite(path, text, mode) {
+  if (mode == null) { try { mode = statSync(path).mode & 0o777; } catch { /* new file */ } }
   const tmp = `${path}.${process.pid}`;
-  writeFileSync(tmp, text, mode ? { mode } : undefined);
+  writeFileSync(tmp, text, mode != null ? { mode } : undefined);
   renameSync(tmp, path);
 }
 

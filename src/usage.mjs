@@ -2,7 +2,7 @@
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { CACHE_FILE, FAIL_FILE, OAUTH_BETA, USAGE_URL, USER_AGENT, WEEK_MS } from './config.mjs';
 
-export const num = v => (v == null || Number.isNaN(Number(v)) ? null : Number(v));
+const num = v => (v == null || Number.isNaN(Number(v)) ? null : Number(v));
 
 export async function fetchUsage(accessToken, { cacheAs = null, timeoutMs = 10_000 } = {}) {
   const ctrl = new AbortController();
@@ -30,13 +30,13 @@ export function readCache(email) {
   try {
     const st = statSync(CACHE_FILE);
     const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
-    if (data?._account && email && data._account !== email) return null; // another account's numbers
+    if (data?._account && data._account !== email) return null; // another account's numbers (or nobody logged in)
     if (data?.five_hour || data?.limits) return { data, fetchedAt: st.mtimeMs };
   } catch { /* no cache */ }
   return null;
 }
 export function writeCache(data) {
-  try { const tmp = `${CACHE_FILE}.${process.pid}`; writeFileSync(tmp, JSON.stringify(data)); renameSync(tmp, CACHE_FILE); } catch { /* best effort */ }
+  try { const tmp = `${CACHE_FILE}.${process.pid}`; writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 }); renameSync(tmp, CACHE_FILE); } catch { /* best effort */ }
   try { unlinkSync(FAIL_FILE); } catch { /* none */ }
 }
 export function markFail() { try { writeFileSync(FAIL_FILE, ''); } catch { /* best effort */ } }

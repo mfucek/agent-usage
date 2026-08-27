@@ -16,6 +16,7 @@ import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
 import { fetchUsage, markFail, normalize, readCache } from './usage.mjs';
 
 const firstLine = e => String(e?.message || e).split('\n')[0];
+const sameEmail = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 const backoff = (prev, retryAfterMs) => Math.max(retryAfterMs || 0, Math.min((prev || MIN_BACKOFF_MS / 2) * 2, MAX_BACKOFF_MS));
 
 // ─── One-shot commands ───────────────────────────────────────────────────────
@@ -53,9 +54,11 @@ async function runCommand() {
 
 // ─── Probe loop ──────────────────────────────────────────────────────────────
 function createApp() {
+  let cred = {};
+  try { cred = loadCredentials(); } catch { /* nobody logged in: archived cards still work */ }
   const state = {
-    cred: loadCredentials(), account: loadAccount(), usage: null, usageAt: null, error: null,
-    probing: false, backoffMs: 0, backoffUntil: 0, activeRefresh: null, activeRefreshTriedAt: 0,
+    cred, account: loadAccount(), usage: null, usageAt: null, error: null,
+    probing: false, pendingForce: false, backoffMs: 0, backoffUntil: 0, activeRefresh: null, activeRefreshTriedAt: 0,
     localBy: new Map(), sessions: 0, others: new Map(), sel: 0, msg: null, msgAt: 0,
   };
   logActiveAccount(state.account.email);
@@ -82,7 +85,7 @@ function createApp() {
     state.activeRefresh = null;
     if (!state.cred?.refreshToken || exp - now >= ACTIVE_REFRESH_AHEAD_MS || (rexp && rexp < now)) return;
     if (now - state.activeRefreshTriedAt < REFRESH_RETRY_MS) return;
-    const running = countClaudeProcs();
+    const running = state.sessions; // refreshed every PS_POLL_MS by pollSessions
     if (running) { state.activeRefresh = `token ${exp <= now ? 'expired' : 'expiring'} — ${running} claude session(s) running, leaving refresh to them`; return; }
     state.activeRefreshTriedAt = now;
     try {
@@ -111,8 +114,8 @@ function createApp() {
       else {
         o.refreshError = null;
         const fresh = readAccount(rec.email) || rec;
-        fresh.oauth = r; fresh.seenAt = now; fresh.savedAt = now; saveAccount(fresh);
-        rec.oauth = r; exp = Number(r.expiresAt) || 0; o.live = false;
+        fresh.oauth = r; fresh.savedAt = now; saveAccount(fresh); // not a login: seenAt stays
+        rec.oauth = r; exp = Number(r.expiresAt) || 0;
       }
     }
     const due = force || now - o.lastAt >= OTHER_INTERVAL_MS;
@@ -131,56 +134,64 @@ function createApp() {
     } else if (!(exp > now)) o.live = false;
   }
 
-  async function probeActive(force) {
+  // `email` / `cred` are snapshots: pollSessions may swap state.account while
+  // we are awaiting, and the response must be filed under the account it was
+  // fetched for.
+  async function probeActive(force, email, cred) {
     const t0 = Date.now();
+    if (!cred?.accessToken) { state.error = 'not logged in — press l or switch to an archived account'; return; }
     // Prefer a fresh shared cache (statusline or another agent-usage may have
     // just fetched). Only hit the network when it is stale or missing.
-    const cached = force ? null : readCache(state.account.email);
-    let r;
-    if (cached && t0 - cached.fetchedAt < CACHE_TTL_MS) r = cached;
-    else if (!force && cached && state.backoffMs && t0 < state.backoffUntil) r = cached; // still backing off: show stale
-    else r = await fetchUsage(state.cred.accessToken, { cacheAs: state.account.email });
+    const cached = force ? null : readCache(email);
+    let r, served = false;
+    if (cached && t0 - cached.fetchedAt < CACHE_TTL_MS) { r = cached; served = true; }
+    else if (!force && cached && state.backoffMs && t0 < state.backoffUntil) { r = cached; served = true; } // still backing off: show stale
+    else r = await fetchUsage(cred.accessToken, { cacheAs: email });
 
     if (r.error) {
       state.error = r.error;
-      if (r.status === 429) { state.backoffMs = backoff(state.backoffMs, r.retryAfterMs); state.backoffUntil = Date.now() + state.backoffMs; markFail(); }
+      markFail();
+      if (r.status === 429) { state.backoffMs = backoff(state.backoffMs, r.retryAfterMs); state.backoffUntil = Date.now() + state.backoffMs; }
       // Fall back to whatever the last good response was (ours, statusline's, or the archive).
-      const stale = readCache(state.account.email);
-      const arch = state.account.email ? readAccount(state.account.email) : null;
+      const stale = readCache(email);
+      const arch = email ? readAccount(email) : null;
       if (stale) { state.usage = normalize(stale.data); state.usageAt = stale.fetchedAt; }
       else if (arch?.usage) { state.usage = normalize(arch.usage); state.usageAt = arch.usageAt; }
       if (opts.json) { console.error(r.error); process.exit(1); }
       return;
     }
-    state.error = null; state.backoffMs = 0; state.backoffUntil = 0;
-    if (opts.json) { console.log(JSON.stringify(r.data, null, 2)); process.exit(0); }
+    if (!served) { state.error = null; state.backoffMs = 0; state.backoffUntil = 0; } // a served cache does not clear a live backoff
+    if (opts.json) { const { _account, ...data } = r.data; console.log(JSON.stringify(data, null, 2)); process.exit(0); }
     state.usage = normalize(r.data);
     state.usageAt = r.fetchedAt;
-    if (state.account.email) { try { archiveUsage(state.account.email, r.data, r.fetchedAt); } catch { /* best effort */ } }
+    if (email && !served) { try { archiveUsage(email, r.data, r.fetchedAt); } catch { /* best effort */ } }
   }
 
   async function probe(force = false) {
-    if (state.probing) return;
+    if (state.probing) { if (force) state.pendingForce = true; return; }
     state.probing = true;
     try {
       // Re-read credentials/account each probe so a re-login (different account)
       // is picked up without restarting.
-      try { state.cred = loadCredentials(); } catch { /* keep last known */ }
+      try { state.cred = loadCredentials(); } catch { state.cred = {}; }
       state.account = loadAccount();
-      logActiveAccount(state.account.email);
+      const { email } = state.account;
+      logActiveAccount(email);
       await maybeRefreshActive();
-      try { archiveActive(state.cred, state.account); } catch { /* best effort */ }
-      await probeActive(force);
+      const cred = state.cred;
+      try { archiveActive(cred, state.account); } catch { /* best effort */ }
+      await probeActive(force, email, cred);
       for (const rec of listAccounts()) {
-        if (rec.email === state.account.email) continue;
+        if (sameEmail(rec.email, email)) continue;
         try { await probeOther(rec, force); } catch (e) { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); }
       }
       if (!opts.noLocal) {
         const resets = state.usage?.sessionResetsAt ? Date.parse(state.usage.sessionResetsAt) : null;
         const windowStart = resets && resets > Date.now() ? resets - FIVE_H : Date.now() - FIVE_H;
-        try { scanLocal(windowStart); state.localBy = localSummaryBy(state.account.email); } catch { /* best effort */ }
+        try { scanLocal(windowStart); state.localBy = localSummaryBy(email); } catch { /* best effort */ }
       }
     } finally { state.probing = false; }
+    if (state.pendingForce) { state.pendingForce = false; return probe(true); }
   }
 
   return { state, probe, pollSessions };
@@ -199,8 +210,9 @@ function runLive({ state, probe, pollSessions }) {
     const frame = render(state, Date.now());
     if (frame === lastFrame) return;
     lastFrame = frame;
-    out.write(`${ESC}H${ESC}2J${frame}\n`);
+    out.write(altScreen ? `${ESC}H${ESC}2J${frame}\n` : `${frame}\n\n`);
   };
+  out.on('resize', () => { lastFrame = ''; draw(); });
   const say = m => { state.msg = m; state.msgAt = Date.now(); };
   const resetActive = () => { state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0; state.activeRefreshTriedAt = 0; };
   const reprobe = () => probe(true).catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(draw);

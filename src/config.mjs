@@ -4,10 +4,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const VERSION = '2.0.0';
-export const USER_AGENT = `agent-usage/${VERSION}`;
-
 const HOME = homedir();
+const pkg = (() => { try { return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')); } catch { return {}; } })();
+export const VERSION = pkg.version || '0.0.0';
+export const USER_AGENT = `agent-usage/${VERSION}`;
 
 // ─── Claude Code's files ─────────────────────────────────────────────────────
 // Claude Code keeps everything under CLAUDE_CONFIG_DIR (default ~/.claude):
