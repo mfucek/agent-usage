@@ -2,13 +2,14 @@
 import { statSync } from 'node:fs';
 import { HELP, opts } from './cli.mjs';
 import {
-  CACHE_TTL_MS, CLAUDE_JSON, FIVE_H, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
-  REFRESH_AHEAD_MS, REFRESH_RETRY_MS,
+  ACTIVE_REFRESH_AHEAD_MS, CACHE_TTL_MS, CLAUDE_JSON, FIVE_H, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
+  REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS,
 } from './config.mjs';
 import { archiveActive, archiveUsage, forgetAccount, listAccounts, logActiveAccount, readAccount, saveAccount } from './archive.mjs';
-import { loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
+import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
 import { ESC, fmtDur, paint } from './format.mjs';
 import { countClaudeProcs, localSummaryBy, scanLocal } from './local.mjs';
+import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { activeIndex, cardList, render } from './render.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
@@ -72,20 +73,28 @@ function createApp() {
   }
 
   // Refresh the logged-in account's token ourselves only when no `claude`
-  // process is running; otherwise the sessions refresh it themselves.
+  // process is running; otherwise the sessions refresh it themselves. Done
+  // under Claude Code's refresh lock, re-checking the store once held, exactly
+  // like its checkAndRefreshOAuthTokenIfNeeded.
   async function maybeRefreshActive() {
     const now = Date.now();
     const exp = Number(state.cred?.expiresAt) || 0, rexp = Number(state.cred?.refreshTokenExpiresAt) || 0;
     state.activeRefresh = null;
-    if (!state.cred?.refreshToken || exp - now >= REFRESH_AHEAD_MS || (rexp && rexp < now)) return;
+    if (!state.cred?.refreshToken || exp - now >= ACTIVE_REFRESH_AHEAD_MS || (rexp && rexp < now)) return;
     if (now - state.activeRefreshTriedAt < REFRESH_RETRY_MS) return;
     const running = countClaudeProcs();
     if (running) { state.activeRefresh = `token ${exp <= now ? 'expired' : 'expiring'} — ${running} claude session(s) running, leaving refresh to them`; return; }
     state.activeRefreshTriedAt = now;
-    const r = await refreshOauth(state.cred);
-    if (r.error) { state.activeRefresh = r.error; return; }
-    try { writeCredentials(loadCredentialBlob(), r); state.cred = r; state.activeRefresh = null; }
-    catch (e) { state.activeRefresh = `refreshed but could not store: ${firstLine(e)}`; }
+    try {
+      await withLockAsync(REFRESH_LOCK, async () => {
+        const blob = loadCredentialBlob();
+        const cur = blob.json?.claudeAiOauth;
+        if (cur?.accessToken && cur.accessToken !== state.cred.accessToken) { state.cred = cur; return; } // someone else refreshed meanwhile
+        const r = await refreshOauth(state.cred);
+        if (r.error) { state.activeRefresh = r.error; return; }
+        writeCredentials(blob, r); state.cred = r;
+      });
+    } catch (e) { state.activeRefresh = `refresh: ${firstLine(e)}`; }
   }
 
   async function probeOther(rec, force) {
@@ -257,6 +266,7 @@ function runLive({ state, probe, pollSessions }) {
 
 export async function main() {
   if (await runCommand()) return;
+  if (ENV_TOKEN_OVERRIDE) console.error('agent-usage: CLAUDE_CODE_OAUTH_TOKEN is set — claude sessions started from this shell ignore the keychain, so switching will not affect them');
   const app = createApp();
   if (opts.once || opts.json) {
     await app.probe();

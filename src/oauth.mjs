@@ -3,8 +3,12 @@ import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import {
-  AUTHORIZE_URL, LOGIN_PORT, OAUTH_BETA, OAUTH_CLIENT_ID, OAUTH_SCOPES, PROFILE_URL, TOKEN_URL, USER_AGENT,
+  AUTHORIZE_URL, LOGIN_PORT, OAUTH_BETA, OAUTH_CLIENT_ID, OAUTH_SCOPES, PROFILE_URL, REFRESH_SCOPES, TOKEN_URL, USER_AGENT,
 } from './config.mjs';
+
+// organization_type -> subscriptionType, as Claude Code derives it
+// (src/services/oauth/client.ts, "Reuse the logic from fetchSubscriptionType").
+const SUBSCRIPTION_BY_ORG_TYPE = { claude_max: 'max', claude_pro: 'pro', claude_enterprise: 'enterprise', claude_team: 'team' };
 
 const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT };
 const b64url = b => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -38,7 +42,7 @@ export async function refreshOauth(oauth, { timeoutMs = 15_000 } = {}) {
     const res = await fetch(TOKEN_URL, {
       method: 'POST',
       headers: JSON_HEADERS,
-      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: OAUTH_CLIENT_ID, scope: (oauth.scopes || OAUTH_SCOPES).join(' ') }),
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: OAUTH_CLIENT_ID, scope: REFRESH_SCOPES.join(' ') }),
       signal: ctrl.signal,
     });
     const body = await res.json().catch(() => ({}));
@@ -89,15 +93,17 @@ async function fetchProfile(accessToken) {
   const prof = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`profile HTTP ${res.status}`);
   const a = prof.account || {}, org = prof.organization || {};
-  if (!a.email_address) throw new Error('profile response had no email');
+  const email = a.email || a.email_address; // src/services/oauth/client.ts reads `account.email`
+  if (!email) throw new Error('profile response had no email');
+  // Claude Code's AccountInfo shape (src/utils/config.ts). organizationRole /
+  // workspaceRole come from a separate roles endpoint and are left unset.
   const account = {
-    accountUuid: a.uuid, emailAddress: a.email_address, displayName: a.display_name || a.full_name || undefined, fullName: a.full_name || undefined,
-    organizationUuid: org.uuid, organizationName: org.name, organizationType: org.organization_type, organizationRole: org.role || undefined,
-    billingType: org.billing_type || undefined, hasExtraUsageEnabled: a.has_extra_usage_enabled ?? org.has_extra_usage_enabled ?? undefined,
-    organizationRateLimitTier: org.rate_limit_tier || undefined, userRateLimitTier: a.rate_limit_tier || undefined, profileFetchedAt: Date.now(),
+    accountUuid: a.uuid, emailAddress: email, organizationUuid: org.uuid, organizationName: org.name,
+    displayName: a.display_name || a.full_name || undefined, hasExtraUsageEnabled: org.has_extra_usage_enabled ?? a.has_extra_usage_enabled ?? undefined,
+    billingType: org.billing_type || undefined, accountCreatedAt: a.created_at || undefined, subscriptionCreatedAt: org.subscription_created_at || undefined,
   };
   for (const k of Object.keys(account)) if (account[k] === undefined) delete account[k];
-  return { account, profile: prof, subscriptionType: org.subscription_type || a.subscription_type, rateLimitTier: org.rate_limit_tier || a.rate_limit_tier };
+  return { account, profile: prof, subscriptionType: SUBSCRIPTION_BY_ORG_TYPE[org.organization_type] || null, rateLimitTier: org.rate_limit_tier || a.rate_limit_tier };
 }
 
 // Runs the whole flow: local callback listener -> browser -> code exchange ->

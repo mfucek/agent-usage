@@ -35,8 +35,12 @@ export function forgetAccount(email) { try { unlinkSync(accountFile(email)); ret
 export function archiveActive(oauth, account) {
   if (!account?.email || !oauth?.accessToken) return null;
   const rec = readAccount(account.email) || { email: account.email };
-  const changed = JSON.stringify(rec.oauth) !== JSON.stringify(oauth) || JSON.stringify(rec.oauthAccount) !== JSON.stringify(account.raw);
-  rec.oauth = oauth; rec.oauthAccount = account.raw; rec.seenAt = Date.now();
+  // Claude Code drops fields it does not know when it rewrites the blob;
+  // refreshTokenExpiresAt is ours, keep it from the archive.
+  const next = { ...oauth };
+  if (next.refreshTokenExpiresAt == null && rec.oauth?.refreshTokenExpiresAt != null && rec.oauth.refreshToken === next.refreshToken) next.refreshTokenExpiresAt = rec.oauth.refreshTokenExpiresAt;
+  const changed = JSON.stringify(rec.oauth) !== JSON.stringify(next) || JSON.stringify(rec.oauthAccount) !== JSON.stringify(account.raw);
+  rec.oauth = next; rec.oauthAccount = account.raw; rec.seenAt = Date.now();
   if (changed || !rec.savedAt || Date.now() - rec.savedAt > 10 * 60_000) { rec.savedAt = Date.now(); saveAccount(rec); }
   return rec;
 }

@@ -5,8 +5,14 @@ import { join } from 'node:path';
 import { PROJECTS_DIR } from './config.mjs';
 import { accountAt, safeReaddir } from './archive.mjs';
 
+// Claude Code processes: comm is `claude` for the launcher, but the native
+// installer's versioned binary (~/.local/share/claude/versions/<v>) shows up
+// under its own path, so match both.
+const isClaudeProc = comm => comm === 'claude' || comm.endsWith('/claude') || /\/share\/claude\/versions\//.test(comm);
 export function countClaudeProcs() {
-  try { return execFileSync('pgrep', ['-x', 'claude'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim().split('\n').filter(Boolean).length; } catch { return 0; }
+  try {
+    return execFileSync('ps', ['-Ao', 'comm='], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().split('\n').map(s => s.trim()).filter(isClaudeProc).length;
+  } catch { return 0; }
 }
 
 // ─── Transcript scan (incremental) ───────────────────────────────────────────
@@ -45,9 +51,10 @@ export function scanLocal(windowStart) {
         let j; try { j = JSON.parse(line); } catch { continue; }
         const u = j?.message?.usage;
         if (!u || j.type !== 'assistant') continue;
+        if (j.message?.model === '<synthetic>') continue; // local placeholder, not an API call (Claude Code excludes these too)
         const ts = Date.parse(j.timestamp);
         if (!ts || ts < windowStart) continue;
-        const id = j.requestId || j.message?.id || `${p}:${st.offset}:${ts}`;
+        const id = j.requestId || j.message?.id || j.uuid || `${p}:${ts}:${line.length}`;
         const tokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
         const prev = requests.get(id);
         requests.set(id, { ts, tokens: Math.max(prev?.tokens || 0, tokens) });

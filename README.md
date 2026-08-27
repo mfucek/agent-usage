@@ -87,7 +87,26 @@ Header: `●` logged in / `○` archived · plan · `ok` / `near limit` / `exhau
 
 - Every account seen logged in is archived under `~/.local/state/agent-usage/accounts/<email>.json` (mode 600): its `claudeAiOauth` tokens, `oauthAccount` identity and last usage response. Nothing to configure — log into a second account with `claude /login` (or press `l`) while agent-usage runs and a card appears.
 - Archived tokens are kept alive: within 30 min of expiry the access token is refreshed with the archived refresh token (rotated tokens are written back), and usage is polled once an hour. A card only falls back to "last known" when the refresh token itself is dead.
-- The logged-in account's tokens are re-copied into the archive every probe, so a refresh performed by Claude Code (which rotates refresh tokens) is picked up within one interval. agent-usage refreshes the logged-in token itself only while no `claude` process is running; otherwise the sessions do it and the `Token` row says so.
+- The logged-in account's tokens are re-copied into the archive every probe, so a refresh performed by Claude Code (which rotates refresh tokens) is picked up within one interval. agent-usage refreshes the logged-in token itself only while no `claude` process is running, with Claude Code's own 5-minute expiry buffer and under its refresh lock (`~/.claude.lock`); otherwise the sessions do it and the `Token` row says so.
+- Refresh requests send the same scope set Claude Code sends for claude.ai tokens (`user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload`), so a token stored with a narrower set gets widened by the server instead of frozen.
+
+## Playing nice with Claude Code
+
+Everything that touches Claude Code's files mirrors what Claude Code does (checked against its source):
+
+| | Claude Code | agent-usage |
+| --- | --- | --- |
+| Token store | keychain item `Claude Code-credentials` filtered by `-a $USER`; `.credentials.json` only when the keychain has nothing | same lookup; writes back to whichever store the blob was read from |
+| `CLAUDE_CONFIG_DIR` | keychain service gets a `-<sha256[:8]>` suffix, `.claude.json` moves into the dir, legacy `.config.json` wins | same |
+| `.claude.json` writes | `proper-lockfile` on `<file>.lock` | same lock (mkdir semantics, 10s stale) |
+| Token refresh | lock on `<configDir>.lock`, re-check under the lock, 5-min buffer | same |
+| `claudeAiOauth` fields | rewrites exactly `accessToken refreshToken expiresAt scopes subscriptionType rateLimitTier` | writes only those; `refreshTokenExpiresAt` lives in the archive |
+| Login | `/api/oauth/profile` → `account.email`, `subscriptionType` from `organization.organization_type` | same |
+| Running processes | — | `ps` for `claude` and `~/.local/share/claude/versions/*` (the native binary) |
+| Transcript accounting | one line per content block, final usage on the last, `<synthetic>` excluded | dedup by `requestId` taking max, `<synthetic>` excluded |
+| `CLAUDE_CODE_OAUTH_TOKEN` | sessions ignore the keychain | warns at startup that switching will not reach those sessions |
+
+Not mirrored, on purpose: Claude Code's `/login` wipes the whole keychain blob (MCP tokens included) and every account-scoped cache; a switch here keeps `mcpOAuth` so Figma/Cloudflare/… stay logged in.
 
 ### Switching
 
@@ -108,6 +127,7 @@ bin/agent-usage.mjs   entry
 src/cli.mjs           argv → opts, help text
 src/config.mjs        paths, endpoints, tunables, ~/.config/agent-usage/config.json
 src/credentials.mjs   keychain / .credentials.json blob, oauthAccount in .claude.json
+src/lock.mjs          proper-lockfile-compatible locks shared with Claude Code
 src/archive.mjs       per-account archive + switch log
 src/oauth.mjs         token refresh, browser PKCE login, profile
 src/switch.mjs        switchTo / storeLogin
