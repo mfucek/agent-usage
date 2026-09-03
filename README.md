@@ -61,11 +61,16 @@ agent-usage --json           # endpoint JSON for the logged-in account (may come
 agent-usage --no-local       # skip the local transcript scan (Usage row)
 agent-usage --no-color
 
-agent-usage --accounts       # list archived accounts (token / refresh validity)
-agent-usage --switch EMAIL   # make EMAIL the logged-in Claude Code account
-agent-usage --forget EMAIL   # drop an archived account
-agent-usage --login          # browser login (PKCE), archive + activate
+agent-usage list             # list archived accounts (token / refresh validity, session usage)
+agent-usage select EMAIL     # make EMAIL the logged-in Claude Code account
+agent-usage whoami           # print the logged-in account's email
+agent-usage status           # print the dashboard once and exit (same as --once)
+agent-usage json             # same as --json
+agent-usage forget EMAIL     # drop an archived account
+agent-usage login            # browser login (PKCE), archive + activate
 ```
+
+`select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
 
 Live keys: `↑/↓` (or `j/k`) select · `Enter` switch · `l` browser login · `r` probe now · `q` quit.
 

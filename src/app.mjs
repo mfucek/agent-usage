@@ -13,15 +13,37 @@ import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { activeIndex, cardList, render } from './render.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
-import { fetchUsage, markFail, normalize, readCache } from './usage.mjs';
+import { fetchUsage, markFail, normalize, projectRows, readCache } from './usage.mjs';
 
 const firstLine = e => String(e?.message || e).split('\n')[0];
 const sameEmail = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 const backoff = (prev, retryAfterMs) => Math.max(retryAfterMs || 0, Math.min((prev || MIN_BACKOFF_MS / 2) * 2, MAX_BACKOFF_MS));
 
+// Accept a partial email for select/forget: an exact match wins, otherwise a
+// unique case-insensitive substring of an archived account's email.
+function resolveEmail(input) {
+  const q = input.toLowerCase();
+  const all = listAccounts().map(r => r.email);
+  const exact = all.filter(e => e.toLowerCase() === q);
+  const matches = exact.length ? exact : all.filter(e => e.toLowerCase().includes(q));
+  if (matches.length > 1) throw new Error(`'${input}' matches several accounts: ${matches.join(', ')}`);
+  return matches[0] || input; // no match: pass through, the command reports "nothing archived"
+}
+
+// Session-bucket summary from the archived usage snapshot, aged to `now`.
+function sessionSummary(rec, now) {
+  if (!rec.usage) return '';
+  const rows = projectRows(normalize(rec.usage).rows, now);
+  const s = rows.find(r => r.window === 'session');
+  if (!s) return '';
+  if (s.resetsAt == null || s.percent == null) return '  session idle';
+  return `  session ${Math.round(s.percent)}%${s.percent >= 100 ? ' FULL' : ''} resets ${fmtDur(Date.parse(s.resetsAt) - now)}`;
+}
+
 // ─── One-shot commands ───────────────────────────────────────────────────────
 async function runCommand() {
   if (opts.help) { console.log(HELP); return true; }
+  if (opts.whoami) { console.log(loadAccount().email || 'nobody logged in'); return true; }
   if (opts.accounts) {
     const cur = loadAccount().email;
     const list = listAccounts();
@@ -29,19 +51,21 @@ async function runCommand() {
     const now = Date.now();
     for (const r of list) {
       const exp = Number(r.oauth?.expiresAt) || 0, rexp = Number(r.oauth?.refreshTokenExpiresAt) || 0;
-      console.log(`${r.email === cur ? '*' : ' '} ${r.email.padEnd(28)} ${planLabel(r.oauth).padEnd(10)} seen ${fmtDur(now - (r.seenAt || 0)).padEnd(6)} ago  token ${exp > now ? `valid ${fmtDur(exp - now)}` : 'expired'}  refresh ${rexp ? (rexp > now ? `valid ${fmtDur(rexp - now)}` : 'EXPIRED') : '?'}`);
+      console.log(`${r.email === cur ? '*' : ' '} ${r.email.padEnd(28)} ${planLabel(r.oauth).padEnd(10)} seen ${fmtDur(now - (r.seenAt || 0)).padEnd(6)} ago  token ${exp > now ? `valid ${fmtDur(exp - now)}` : 'expired'}  refresh ${rexp ? (rexp > now ? `valid ${fmtDur(rexp - now)}` : 'EXPIRED') : '?'}${sessionSummary(r, now)}`);
     }
     return true;
   }
   if (opts.forget != null) {
-    if (!opts.forget) throw new Error('--forget needs an email');
-    console.log(forgetAccount(opts.forget) ? `forgot ${opts.forget}` : `${opts.forget}: nothing archived`);
+    if (!opts.forget) throw new Error('forget needs an email');
+    const email = resolveEmail(opts.forget);
+    console.log(forgetAccount(email) ? `forgot ${email}` : `${email}: nothing archived`);
     return true;
   }
   if (opts.switchTo != null) {
-    if (!opts.switchTo) throw new Error('--switch needs an email');
-    const r = switchTo(opts.switchTo);
-    console.log(r.already ? `${opts.switchTo} is already the logged-in account` : `switched Claude Code to ${opts.switchTo}${r.running ? ` — ${r.running} running claude session(s) ${HANDOVER_NOTE}` : ''}`);
+    if (!opts.switchTo) throw new Error('select needs an email');
+    const email = resolveEmail(opts.switchTo);
+    const r = switchTo(email);
+    console.log(r.already ? `${email} is already the logged-in account` : `switched Claude Code to ${email}${r.running ? ` — ${r.running} running claude session(s) ${HANDOVER_NOTE}` : ''}`);
     return true;
   }
   if (opts.login) {
