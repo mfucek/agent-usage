@@ -68,11 +68,23 @@ agent-usage status           # print the dashboard once and exit (same as --once
 agent-usage json             # same as --json
 agent-usage forget EMAIL     # drop an archived account
 agent-usage login            # browser login (PKCE), archive + activate
+agent-usage auto [on|off]    # show or set auto-switch (see below)
 ```
 
 `select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
 
-Live keys: `↑/↓` (or `j/k`) select · `Enter` switch · `l` browser login · `r` probe now · `q` quit.
+Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle auto-switch) · `l` browser login · `r` probe now · `q` quit.
+
+## Auto-switch
+
+The last selectable row in the TUI is a toggle (also `agent-usage auto on|off`, persisted as `"autoSwitch"` in the config file):
+
+```
+> [x] auto-switch account at 90% session usage
+      next: matija@example.com (session 45%, fable 68%, resets 1h55m)
+```
+
+While the TUI is running, each probe checks the logged-in account; at ≥90% session usage it switches to the account with session <90%, Fable <90%, a live refresh token, and the **nearest session reset** (an idle account counts as a full 5h away). The gray `next:` line always shows who that would be. The threshold is `"autoThreshold"` in the config. Nothing switches when the TUI isn't running.
 
 ## The rows
 

@@ -5,6 +5,7 @@ import { lastSwitchAt, listAccounts } from './archive.mjs';
 import { planLabel } from './credentials.mjs';
 import { fmtDur, fmtNum, label, paint, pct, usageBar } from './format.mjs';
 import { accountStatus, normalize, projectRows } from './usage.mjs';
+import { AUTO_THRESHOLD, autoEnabled, pickCandidate } from './auto.mjs';
 
 const PLACEHOLDER_ROWS = ['Session', 'Weekly', 'Fable'];
 const STATUS_PAINT = { ok: paint.green, 'near limit': paint.yellow, exhausted: paint.red, unknown: paint.gray };
@@ -20,7 +21,8 @@ export const activeIndex = cards => Math.max(0, cards.findIndex(c => c.active));
 export function render(state, now) {
   const L = [];
   const cards = cardList(state);
-  if (state.sel >= cards.length) state.sel = cards.length - 1;
+  // Selectable items: the account cards plus the auto-switch toggle after them.
+  if (state.sel > cards.length) state.sel = cards.length;
   const cursor = i => (!opts.once && i === state.sel ? paint.cyan('>') : ' ');
 
   L.push(paint.bold('agent-usage'));
@@ -30,12 +32,26 @@ export function render(state, now) {
     else renderArchived(L, state, now, cursor(i), c);
   });
 
+  L.push('');
+  renderAutoToggle(L, state, now, cursor(cards.length));
+
   if (!opts.once) {
     L.push('');
     if (state.msg && now - state.msgAt < MSG_TTL_MS) L.push(state.msg);
-    L.push(paint.dim(`probe every ${fmtDur(opts.intervalMs)} · ↑↓ select · enter switch · l login · r probe now · q quit`));
+    L.push(paint.dim(`probe every ${fmtDur(opts.intervalMs)} · ↑↓ select · enter switch/toggle · l login · r probe now · q quit`));
   }
   return L.join('\n');
+}
+
+function renderAutoToggle(L, state, now, cur) {
+  const on = autoEnabled();
+  const box = on ? paint.green('[x]') : paint.dim('[ ]');
+  const text = `auto-switch account at ${AUTO_THRESHOLD}% session usage`;
+  L.push(`${cur} ${box} ${on ? text : paint.dim(text)}`);
+  const c = pickCandidate(state.account.email, state.others, now);
+  L.push(paint.gray(c
+    ? `      next: ${c.email} (session ${Math.round(c.sess)}%, fable ${Math.round(c.fable)}%, resets ${fmtDur(c.tts)})`
+    : '      next: no eligible account (all over threshold, expired, or unprobed)'));
 }
 
 function quotaLine(row, now, muted = false) {

@@ -11,6 +11,7 @@ import { ESC, fmtDur, paint } from './format.mjs';
 import { countClaudeProcs, localSummaryBy, scanLocal } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
+import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } from './auto.mjs';
 import { activeIndex, cardList, render } from './render.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
 import { fetchUsage, markFail, normalize, projectRows, readCache } from './usage.mjs';
@@ -71,6 +72,17 @@ async function runCommand() {
   if (opts.login) {
     const r = await browserLogin({ onStatus: m => console.error(m) });
     console.log(storeLogin(r, { activate: true }));
+    return true;
+  }
+  if (opts.auto != null) {
+    const v = opts.auto.toLowerCase();
+    if (v === 'on' || v === 'off') setAuto(v === 'on');
+    else if (v) throw new Error(`auto takes 'on' or 'off', not '${opts.auto}'`);
+    console.log(`auto-switch: ${autoEnabled() ? 'on' : 'off'} (at ${AUTO_THRESHOLD}% session usage, while the TUI runs)`);
+    const c = pickCandidate(loadAccount().email);
+    console.log(c
+      ? `next: ${c.email} (session ${Math.round(c.sess)}%, fable ${Math.round(c.fable)}%, resets ${fmtDur(c.tts)})`
+      : 'next: no eligible account');
     return true;
   }
   return false;
@@ -241,16 +253,38 @@ function runLive({ state, probe, pollSessions }) {
   const resetActive = () => { state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0; state.activeRefreshTriedAt = 0; };
   const reprobe = () => probe(true).catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(draw);
 
-  function doSwitch() {
-    const c = cardList(state)[state.sel];
-    if (!c || c.active) { say(paint.dim('already the logged-in account')); return; }
+  function switchToEmail(email, verb) {
     try {
-      const r = switchTo(c.email);
-      say(`${paint.green('switched to')} ${paint.cyan(c.email)}${r.running ? paint.yellow(` — ${r.running} running claude session(s) ${HANDOVER_NOTE}`) : ''}`);
+      const r = switchTo(email);
+      say(`${paint.green(verb)} ${paint.cyan(email)}${r.running ? paint.yellow(` — ${r.running} running claude session(s) ${HANDOVER_NOTE}`) : ''}`);
       resetActive();
       pollSessions();
       reprobe();
     } catch (e) { say(`${paint.red('switch failed:')} ${firstLine(e)}`); }
+  }
+
+  function doSwitch() {
+    const cards = cardList(state);
+    if (state.sel === cards.length) { // the auto-switch toggle row
+      const on = setAuto(!autoEnabled());
+      say(on ? `${paint.green('auto-switch on')} — switches at ${AUTO_THRESHOLD}% session usage while this TUI runs` : paint.dim('auto-switch off'));
+      return;
+    }
+    const c = cards[state.sel];
+    if (!c || c.active) { say(paint.dim('already the logged-in account')); return; }
+    switchToEmail(c.email, 'switched to');
+  }
+
+  // After each probe: if enabled and the active session is at the threshold,
+  // move to the best candidate. The new account starts under the threshold,
+  // so this fires once per exhausted session, not every probe.
+  function maybeAutoSwitch() {
+    if (!autoEnabled()) return;
+    const a = usageSummary(state.usage);
+    if (!a || a.sess < AUTO_THRESHOLD) return;
+    const c = pickCandidate(state.account.email, state.others);
+    if (!c) { say(paint.yellow(`session ${Math.round(a.sess)}% — auto-switch found no eligible account`)); return; }
+    switchToEmail(c.email, 'auto-switched to');
   }
 
   let loggingIn = false;
@@ -282,7 +316,7 @@ function runLive({ state, probe, pollSessions }) {
       if (k === 'q' || k === '\x03') process.exit(0); // q or Ctrl-C
       else if (k === 'r') reprobe();
       else if (k === '\x1b[A' || k === 'k') state.sel = Math.max(0, state.sel - 1);
-      else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(cardList(state).length - 1, state.sel + 1);
+      else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(cardList(state).length, state.sel + 1); // last index = auto-switch toggle
       else if (k === '\r' || k === '\n') doSwitch();
       else if (k === 'l') doLogin();
       draw();
@@ -290,6 +324,7 @@ function runLive({ state, probe, pollSessions }) {
   }
 
   const loop = () => probe().catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(() => {
+    maybeAutoSwitch();
     draw();
     setTimeout(loop, state.backoffMs || opts.intervalMs).unref?.();
   });

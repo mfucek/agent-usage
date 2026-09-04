@@ -5,7 +5,7 @@ const argv = process.argv.slice(2);
 // Subcommand sugar: `agent-usage list`, `agent-usage select <email>`, … map
 // onto the flags below so scripts get a non-TUI interface without the dashes.
 const SUB_FLAG = { list: 'accounts', accounts: 'accounts', login: 'login', status: 'once', json: 'json', whoami: 'whoami', current: 'whoami', help: 'help' };
-const SUB_ARG = { select: 'switchTo', switch: 'switchTo', forget: 'forget' };
+const SUB_ARG = { select: 'switchTo', switch: 'switchTo', forget: 'forget', auto: 'auto' };
 const sub = {};
 if (argv[0] && !argv[0].startsWith('-')) {
   const cmd = argv.shift();
@@ -33,6 +33,9 @@ commands (one-shot, script-friendly):
   login            log in via the browser (PKCE, like \`claude /login\`), archive
                    the account, make it the logged-in one, and exit
   forget EMAIL     delete EMAIL's archived tokens/usage
+  auto [on|off]    show or set auto-switch: at 90% session usage the live TUI
+                   switches to the account with session <90%, Fable <90%, and
+                   the nearest session reset (acts only while the TUI runs)
 
 options:
   -i, --interval N probe interval in seconds (min 30, default 60)
@@ -50,8 +53,10 @@ flag aliases (same as the commands above; archived under
 
 config (~/.config/agent-usage/config.json):
   { "order": ["a@x.com", "b@y.com"] }   fixed card order; others follow, newest first
+  { "autoSwitch": true }                auto-switch on (the TUI toggle writes this)
+  { "autoThreshold": 90 }               auto-switch trigger/eligibility percent
 
-live keys: ↑/↓ select account · enter switch · l login in browser · r probe now · q quit`;
+live keys: ↑/↓ select account · enter switch (or toggle auto-switch) · l login in browser · r probe now · q quit`;
 
 export const opts = {
   help: has('-h') || has('--help') || !!sub.help,
@@ -65,4 +70,5 @@ export const opts = {
   whoami: !!sub.whoami,
   switchTo: sub.switchTo ?? (has('--switch') ? opt('--switch', '') : null),
   forget: sub.forget ?? (has('--forget') ? opt('--forget', '') : null),
+  auto: sub.auto ?? null,
 };
