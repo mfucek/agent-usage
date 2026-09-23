@@ -1,38 +1,43 @@
 # agent-usage
 
-Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress.
+Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress, spend a banked limit reset with another. Plus a Codex (ChatGPT) card when `~/.codex/auth.json` exists.
 
 Zero dependencies. Node ≥ 18. macOS keychain or `.credentials.json`.
 
 ```
-agent-usage
+agent-usage                                                    probed 12s ago
 
-  ○ matija@example.com (max 20x) · last seen 4h ago · live
-  Session  [██████████████████] 98% reset 1h2m
-  Weekly   [███░░░░░░░░░░░░░░░] 16% reset 6d7h
-  Fable    [███░░░░░░░░░░░░░░░] 16% reset 6d7h
-  Extra    off
-  Claude   no running sessions (local)
-  Usage    0 req, 0 tok (local, 5h window)
+Claude
+  ○ matija@example.com · 4h · live
+  Session  [██████████████████] 98%  1h2m
+  Weekly   [███░░░░░░░░░░░░░░░] 16%  6d7h
+  Fable    [███░░░░░░░░░░░░░░░] 16%  6d7h
+           Extra      Resets       Sessions
+           off        ⟲ –          0
 
-> ● luka@example.com (max 20x) · logged in · ok
-  Session  [████░░░░░░░░░░░░░░] 20% reset 2m
-  Weekly   [█░░░░░░░░░░░░░░░░░] 8% reset 5d17h
-  Fable    [███░░░░░░░░░░░░░░░] 14% reset 5d17h
-  Extra    off
-  Claude   7 running sessions (local)
-  Usage    428 req, 6.2m tok (local, 5h window)
+> ● luka@example.com · logged in · ok
+  Session  [████░░░░░░░░░░░░░░] 20%  2m
+  Weekly   [█░░░░░░░░░░░░░░░░░]  8%  5d17h
+  Fable    [███░░░░░░░░░░░░░░░] 14%  5d17h
+           Extra      Resets       Sessions
+           off        ⟲ 1 · 29d    7
 
-  ○ nino@example.com (max 20x) · last seen 1h ago · last known · token expired
-  Session  [░░░░░░░░░░░░░░░░░░] 0% window ended
-  Weekly   [█████████░░░░░░░░░] 50% reset 2d
-  Fable    [░░░░░░░░░░░░░░░░░░] 0% reset 6d21h (was reset)
-  Extra    off
-  Claude   no running sessions (local)
-  Usage    0 req, 0 tok (local, 5h window)
-  Data     from 5h ago
+  ○ nino@example.com · 1h · last known · token expired
+  Session  [░░░░░░░░░░░░░░░░░░]  0%  ended
+  Weekly   [█████████░░░░░░░░░] 50%  2d
+  Fable    [░░░░░░░░░░░░░░░░░░]  0%  6d21h (reset)
+           Extra      Resets       Sessions
+           off        ⟲ 1 · 29d    0
 
-probe every 1m · ↑↓ select · enter switch · l login · r probe now · q quit
+  [x] auto-switch → matija
+
+Codex
+  ● matija@example.com · ok
+  Weekly   [░░░░░░░░░░░░░░░░░░]  0%  6d23h
+           Extra      Resets       Sessions
+           –          ⟲ 3 · 10d    1
+
+↑↓ select · enter switch · u use reset · l login · r probe · q quit
 ```
 
 ## Install
@@ -58,7 +63,7 @@ agent-usage                  # live: probe every 60s
 agent-usage -i 30            # probe every 30s (min 30)
 agent-usage --once           # print once and exit
 agent-usage --json           # endpoint JSON for the logged-in account (may come from the shared cache)
-agent-usage --no-local       # skip the local transcript scan (Usage row)
+agent-usage --no-codex       # hide the Codex (ChatGPT) card
 agent-usage --no-color
 
 agent-usage list             # list archived accounts (token / refresh validity, session usage)
@@ -69,36 +74,54 @@ agent-usage json             # same as --json
 agent-usage forget EMAIL     # drop an archived account
 agent-usage login            # browser login (PKCE), archive + activate
 agent-usage auto [on|off]    # show or set auto-switch (see below)
+agent-usage reset EMAIL      # spend one banked limit reset on that Claude account (no confirmation)
+agent-usage reset codex      # spend one Codex reset credit
 ```
 
 `select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
 
-Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle auto-switch) · `l` browser login · `r` probe now · `q` quit.
+Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle auto-switch) · `u` use a banked reset on the selected card (press twice) · `l` browser login · `r` probe now · `q` quit.
 
 ## Auto-switch
 
-The last selectable row in the TUI is a toggle (also `agent-usage auto on|off`, persisted as `"autoSwitch"` in the config file):
+The line after the Claude cards is a toggle (also `agent-usage auto on|off`, persisted as `"autoSwitch"` in the config file):
 
 ```
-> [x] auto-switch account at 90% session usage
-      next: matija@example.com (session 45%, fable 68%, resets 1h55m)
+> [x] auto-switch → matija
 ```
 
-While the TUI is running, each probe checks the logged-in account; at ≥90% session usage it switches to the account with session <90%, Fable <90%, a live refresh token, and the **nearest session reset** (an idle account counts as a full 5h away). The gray `next:` line always shows who that would be. The threshold is `"autoThreshold"` in the config. Nothing switches when the TUI isn't running.
+While the TUI is running, each probe checks the logged-in account; at ≥90% session usage it switches to the account with session <90%, Fable <90%, a live refresh token, and the **nearest session reset** (an idle account counts as a full 5h away). The name after the arrow is always who that would be (`none eligible` when nobody qualifies); `agent-usage auto` prints the same with the numbers. The threshold is `"autoThreshold"` in the config. Nothing switches when the TUI isn't running.
 
 ## The rows
 
-Every card shows the same rows, logged in or not.
+Every card shows the same rows, logged in or not: three bars, then three columns.
 
 | Row | Source |
 | --- | --- |
-| **Session / Weekly / Fable** | `GET api.anthropic.com/api/oauth/usage` — the zero-spend endpoint Claude Code itself uses. Fable always gets a row (from the `weekly_scoped` limit); other scoped buckets (Sonnet, Opus) appear when the plan exposes them. Reset moments are applied locally: a 5h window whose reset has passed renders empty ("window ended"); weekly buckets render empty and the countdown rolls forward 7 days ("was reset"). |
-| **Extra** | Extra-usage credits: off, or `%` of the monthly limit. |
-| **Claude** | Running `claude` processes on this machine, refreshed every 2s. All of them count against the logged-in account (see [Switching](#switching)). |
-| **Usage** | Local transcript usage in the current 5h window: assistant messages under `~/.claude/projects/**/*.jsonl`, deduped by `requestId`; tokens = input + cache writes + output (cache reads excluded). Attributed per account via the switch log. Files are read incrementally, so only the first probe scans history. |
-| **Data** | Archived cards only: age of the last usage response when it is not live. |
+| **Session / Weekly / Fable** | `GET api.anthropic.com/api/oauth/usage` — the zero-spend endpoint Claude Code itself uses. Fable always gets a row (from the `weekly_scoped` limit); other scoped buckets (Sonnet, Opus) appear when the plan exposes them. The number after the bar is the time to that bucket's reset. Reset moments are applied locally: a 5h window whose reset has passed renders empty (`ended`); weekly buckets render empty and the countdown rolls forward 7 days (`(reset)`). |
+| **Extra** | Extra-usage credits: `off`, or `%` of the monthly limit. |
+| **Resets** | Banked limit resets (see [Banked resets](#banked-resets)): `⟲ N · 29d` = N resets left, the soonest expiring in 29 days. `⟲ –` none; `⟲ ?` until the first probe that carries the block. |
+| **Sessions** | Running `claude` processes on this machine, refreshed every 2s. All of them count against the logged-in account (see [Switching](#switching)). |
 
-Header: `●` logged in · plan · `ok` / `near limit` / `exhausted`, or `○` archived · plan · last seen · `live` / `last known` / `needs login — press l`.
+Header: `●` email · `logged in` · `ok` / `near limit` / `exhausted`, or `○` email · age since last logged in (gray, `18d`) · `live` / `last known` / `needs login`.
+
+## Banked resets
+
+Both vendors hand out "reset your limits now" tokens that sit in the account until used or expired. The `Resets` row shows them; `u` spends one.
+
+**Claude.** The usage endpoint carries a `cedar_ember` block when asked for it (`?cedar_ember=1`) *and* when the request looks like Claude Code's (`x-app: cli` + its `User-Agent` decide the server-side surface; any other client gets `ineligible_reason: surface` and no grants). agent-usage sends those two headers on every usage probe, so every card gets the block. Each grant has `resets_left`, a use-by date (`ends_at`), the buckets it clears (`five_hour`, `seven_day`, …) and whether it is usable now or only while at a limit. This is the same data behind Claude Code's hidden `/limit-reset` command.
+
+Spending one is Claude Code's own claim: `POST /api/organizations/<org>/reset_rate_limits` with `{ program: "cedar_ember", grant_id, request_id }`. The server answers `reset` (done — the row says what was cleared and how many are left), `not_limited` (the grant only works at a limit; nothing spent), `already_used`, `cooldown`, `ineligible` or `unavailable`; nothing is spent on any answer but `reset`. Afterwards the shared cache is dropped and the account re-probed, so the bars refresh within one interval.
+
+The logged-in card can lag: a probe served from the shared cache (written by the statusline, which asks the plain endpoint) has no grant block, so the row keeps the last block agent-usage fetched itself, seeded from the archive at startup. `r` forces an own fetch. Archived cards always have it — they are only ever probed by agent-usage.
+
+**Codex.** `GET chatgpt.com/backend-api/wham/rate-limit-reset-credits` lists the credits (`/codex/usage` only carries the count); each has an `expires_at` and is one full reset. `u` on the Codex card consumes the soonest-expiring one: `POST …/rate-limit-reset-credits/consume` with `{ credit_id, redeem_request_id }`. The server answers 200 either way — `windows_reset` > 0 means it happened, `code: no_credit` means nothing was spent. This is the only write agent-usage ever sends on the Codex side.
+
+**In the TUI** the first `u` shows what would be spent and asks for a second `u` within 10 s; any other key cancels. The one-shot `agent-usage reset EMAIL|codex` skips the confirmation (it re-probes first so it acts on a fresh grant list).
+
+## The Codex card
+
+When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, one extra card shows Codex quota: `GET chatgpt.com/backend-api/codex/usage` — the endpoint `codex` itself polls for its rate-limit display — probed every 5 minutes, together with the banked reset credits. Rows are the account's main rate-limit windows (a ≤6h window renders like a Session, a 7d one like Weekly; separately-metered extras like Spark are not shown), then the same columns as a Claude card: `Extra` (always `–`), `Resets`, and `Sessions` = running `codex` processes (daemons like `codex app-server` excluded). The auth file is never written and the token never refreshed — the Codex CLI does that itself on its next run; the only write is the reset consume behind `u`. One account only; no switching. Hide it with `--no-codex`.
 
 ## Multiple accounts
 
@@ -113,7 +136,7 @@ Header: `●` logged in · plan · `ok` / `near limit` / `exhausted`, or `○` a
 
 Running sessions follow. Claude Code re-reads the keychain before every API request (`getAnthropicClient` → `checkAndRefreshOAuthTokenIfNeeded` → `invalidateOAuthCacheIfDiskChanged`, through a 30s keychain cache), so every running `claude` is on the new account by its next request, at most 30s later — mid-turn, not at the end of it. A request already in flight finishes on the old account. During that window the `Claude` row shows `picking up this account (≤30s)`.
 
-`~/.local/state/agent-usage/switch-log.jsonl` records when each account became the logged-in one (also when the switch happened outside agent-usage — `~/.claude.json` is watched every 2s). Local `Usage` is attributed by request timestamp against that log. On first run the log is seeded from the archive's last-seen times, so history before that is approximate.
+`~/.local/state/agent-usage/switch-log.jsonl` records when each account became the logged-in one (also when the switch happened outside agent-usage — `~/.claude.json` is watched every 2s).
 
 ## Playing nice with Claude Code
 
@@ -128,7 +151,6 @@ Everything that touches Claude Code's files mirrors what Claude Code does (check
 | `claudeAiOauth` fields | rewrites exactly `accessToken refreshToken expiresAt scopes subscriptionType rateLimitTier` | writes only those; `refreshTokenExpiresAt` lives in the archive |
 | Login | `/api/oauth/profile` → `account.email`, `subscriptionType` from `organization.organization_type` | same |
 | Running processes | — | `ps` for `claude` and `~/.local/share/claude/versions/*` (the native binary) |
-| Transcript accounting | one line per content block, final usage on the last, `<synthetic>` excluded | dedup by `requestId` taking max, `<synthetic>` excluded |
 | `CLAUDE_CODE_OAUTH_TOKEN` | sessions ignore the keychain | warns at startup that switching will not reach those sessions |
 
 Not mirrored, on purpose: Claude Code's `/login` wipes the whole keychain blob (MCP tokens included) and every account-scoped cache; a switch here keeps `mcpOAuth` so Figma/Cloudflare/… stay logged in.
@@ -149,7 +171,7 @@ src/archive.mjs       per-account archive + switch log
 src/oauth.mjs         token refresh, browser PKCE login, profile
 src/switch.mjs        switchTo / storeLogin
 src/usage.mjs         usage endpoint, shared cache, normalisation
-src/local.mjs         running claude processes, transcript scan
+src/local.mjs         running claude processes
 src/format.mjs        ANSI paint, bars, number/duration formatting
 src/render.mjs        the cards
 src/app.mjs           one-shot commands, probe loop, TUI

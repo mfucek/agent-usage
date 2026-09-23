@@ -1,6 +1,7 @@
 // The zero-spend usage endpoint, the shared on-disk cache, and response normalisation.
+import { randomUUID } from 'node:crypto';
 import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { CACHE_FILE, FAIL_FILE, OAUTH_BETA, USAGE_URL, USER_AGENT, WEEK_MS } from './config.mjs';
+import { CACHE_FILE, CLI_HEADERS, FAIL_FILE, OAUTH_BETA, RESET_PROGRAM, USAGE_QUERY, USAGE_URL, WEEK_MS, resetUrl } from './config.mjs';
 
 const num = v => (v == null || Number.isNaN(Number(v)) ? null : Number(v));
 
@@ -8,8 +9,10 @@ export async function fetchUsage(accessToken, { cacheAs = null, timeoutMs = 10_0
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(USAGE_URL, {
-      headers: { Authorization: `Bearer ${accessToken}`, 'anthropic-beta': OAUTH_BETA, Accept: 'application/json', 'User-Agent': USER_AGENT },
+    // Asked with Claude Code's own headers so the response carries the banked
+    // reset block (see USAGE_QUERY / CLI_HEADERS); everything else is unchanged.
+    const res = await fetch(USAGE_URL + USAGE_QUERY, {
+      headers: { Authorization: `Bearer ${accessToken}`, 'anthropic-beta': OAUTH_BETA, Accept: 'application/json', ...CLI_HEADERS },
       signal: ctrl.signal,
     });
     if (!res.ok) {
@@ -73,7 +76,78 @@ export function normalize(data) {
     rows,
     extra: { enabled: !!extra.is_enabled, percent: num(extra.utilization), used: extra.used_credits, limit: extra.monthly_limit },
     sessionResetsAt: session?.resetsAt || null,
+    resets: normalizeResets(data?.cedar_ember),
   };
+}
+
+// ─── Banked resets ───────────────────────────────────────────────────────────
+// The `cedar_ember` block: grants the account has banked, each with a number
+// of resets left, a use-by date and the buckets it clears. `null` when the
+// response was fetched without the block (old cache / other tool).
+const CLEARS_LABEL = { five_hour: 'session', seven_day: 'weekly', seven_day_overage_included: 'extra', seven_day_opus: 'opus', seven_day_sonnet: 'sonnet' };
+export function normalizeResets(ce) {
+  if (!ce || typeof ce !== 'object') return null;
+  const grants = (Array.isArray(ce.grants) ? ce.grants : []).map(g => ({
+    id: String(g.id || ''),
+    label: g.label || '',
+    left: Math.max(0, Number(g.resets_left) || 0),
+    total: Math.max(0, Number(g.resets_total) || 0),
+    startsAt: g.starts_at || null,
+    endsAt: g.ends_at || null,
+    usableNow: !!g.usable_now,
+    paused: !!g.paused,
+    atLimitOnly: g.use_requires_limit !== false,
+    clears: (Array.isArray(g.clears) ? g.clears : []).map(c => CLEARS_LABEL[c] || c),
+  })).filter(g => g.id);
+  return {
+    eligible: !!ce.eligible,
+    reason: ce.ineligible_reason || null,
+    atLimit: !!ce.at_limit,
+    grants,
+    nextGrantId: ce.next_grant_id || null,
+    cooldownUntil: ce.cooldown_until || null,
+    weeklyResetsAt: ce.weekly_resets_at || null,
+  };
+}
+
+// The grant a `u` press would spend: the server's pick when it is still
+// usable, else the first usable one. `now` ages out expired grants.
+export function usableGrant(resets, now = Date.now()) {
+  if (!resets) return null;
+  const ok = g => g.left > 0 && !g.paused && g.usableNow && !(g.endsAt && Date.parse(g.endsAt) <= now) && !(g.startsAt && Date.parse(g.startsAt) > now);
+  const live = resets.grants.filter(ok);
+  return live.find(g => g.id === resets.nextGrantId) || live[0] || null;
+}
+export const bankedCount = (resets, now = Date.now()) => (resets ? resets.grants.filter(g => g.left > 0 && !(g.endsAt && Date.parse(g.endsAt) <= now)).reduce((n, g) => n + g.left, 0) : 0);
+
+// Spend one reset: the same POST Claude Code's /limit-reset sends. Returns
+// { result, resetsLeft, cleared, cooldownUntil } — `result` is the server's word
+// (reset | already_used | not_limited | cooldown | ineligible | unavailable) —
+// or { error }.
+export async function claimReset(accessToken, orgUuid, grantId, { timeoutMs = 25_000 } = {}) {
+  if (!orgUuid) return { error: 'no organization uuid for this account — log in again (l)' };
+  if (!/^[a-z0-9_-]{1,40}$/.test(grantId || '')) return { error: 'no usable grant' };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(resetUrl(orgUuid), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'anthropic-beta': OAUTH_BETA, Accept: 'application/json', 'Content-Type': 'application/json', ...CLI_HEADERS },
+      body: JSON.stringify({ program: RESET_PROGRAM, grant_id: grantId, request_id: randomUUID() }),
+      signal: ctrl.signal,
+    });
+    let body = {}; try { body = await res.json(); } catch { /* no body */ }
+    if (!res.ok) return { error: `HTTP ${res.status}${body?.error?.message ? ': ' + body.error.message : ''}`, status: res.status };
+    return {
+      result: body.result || 'unavailable',
+      reason: body.reason || null,
+      resetsLeft: body.resets_left ?? null,
+      cleared: (Array.isArray(body.cleared) ? body.cleared : []).map(c => CLEARS_LABEL[c] || c),
+      cooldownUntil: body.cooldown_until || null,
+    };
+  } catch (err) {
+    return { error: err?.name === 'AbortError' ? 'claim timed out' : (err?.message || String(err)) };
+  } finally { clearTimeout(t); }
 }
 
 // Age stale rows: once a bucket's reset moment has passed, its bar is empty.

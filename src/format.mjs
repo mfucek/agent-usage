@@ -29,6 +29,8 @@ export function usageBar(percent, width = 18, muted = false) {
 }
 
 export const pct = v => (v == null ? '-' : `${Math.round(v)}%`);
+// "Oct 22" — for use-by dates, where the day matters more than the countdown.
+export const fmtDate = iso => { const t = Date.parse(iso); return Number.isFinite(t) ? new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '?'; };
 export const label = s => paint.dim(s.padEnd(8));
 
 export function fmtNum(n) {
@@ -37,6 +39,9 @@ export function fmtNum(n) {
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
   return String(n);
 }
+
+// Coarsest unit only: "18d", "5h", "12m" — for ages and use-by countdowns.
+export const fmtAge = ms => fmtDur(ms).replace(/^(\d+[dhms]).*$/, '$1');
 
 export function fmtDur(ms) {
   if (!Number.isFinite(ms) || ms < 0) return '-';

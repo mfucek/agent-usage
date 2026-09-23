@@ -20,7 +20,6 @@ export const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, '.c
 const legacyConfig = join(CLAUDE_CONFIG_DIR, '.config.json');
 export const CLAUDE_JSON = existsSync(legacyConfig) ? legacyConfig : join(process.env.CLAUDE_CONFIG_DIR || HOME, '.claude.json');
 export const CRED_FILE = join(CLAUDE_CONFIG_DIR, '.credentials.json');
-export const PROJECTS_DIR = join(CLAUDE_CONFIG_DIR, 'projects');
 const dirHash = process.env.CLAUDE_CONFIG_DIR ? `-${createHash('sha256').update(CLAUDE_CONFIG_DIR).digest('hex').slice(0, 8)}` : '';
 export const KEYCHAIN_SERVICE = `Claude Code-credentials${dirHash}`;
 // Claude Code serialises writes with proper-lockfile: `<file>.lock` around
@@ -41,12 +40,36 @@ export const OAUTH_SCOPES = ['org:create_api_key', 'user:profile', 'user:inferen
 export const REFRESH_SCOPES = ['user:profile', 'user:inference', 'user:sessions:claude_code', 'user:mcp_servers', 'user:file_upload'];
 export const OAUTH_BETA = 'oauth-2025-04-20';
 export const LOGIN_PORT = 54545;
+// Banked limit resets ("cedar_ember" in Claude Code, its hidden /limit-reset).
+// The usage endpoint only includes the grant block when asked for it AND when
+// the request looks like Claude Code's (x-app + its User-Agent decide the
+// server-side "surface"; any other UA gets ineligible_reason: "surface").
+// Claiming one is a POST per organization, same as Claude Code sends.
+export const USAGE_QUERY = '?cedar_ember=1';
+export const CLI_VERSION = '2.1.280';
+export const CLI_HEADERS = { 'x-app': 'cli', 'User-Agent': `claude-cli/${CLI_VERSION} (external, cli)` };
+export const RESET_PROGRAM = 'cedar_ember';
+export const resetUrl = orgUuid => `https://api.anthropic.com/api/organizations/${orgUuid}/reset_rate_limits`;
+export const RESET_CONFIRM_MS = 10_000; // second `u` press must land within this
 
 // Claude Code re-reads the keychain before every API request, through a 30s
 // cache (KEYCHAIN_CACHE_TTL_MS in src/utils/secureStorage/macOsKeychainHelpers.ts).
 // After a switch, every running session is on the new account by its next
 // request, at most this much later.
 export const CLAUDE_TOKEN_CACHE_MS = 30_000;
+
+// ─── Codex's files ───────────────────────────────────────────────────────────
+// The Codex CLI keeps its ChatGPT OAuth tokens in `auth.json` and refreshes
+// them itself on use; we only ever read the file. The usage endpoint is the
+// same one `codex` polls for its own rate-limit display.
+export const CODEX_HOME = process.env.CODEX_HOME || join(HOME, '.codex');
+export const CODEX_AUTH_FILE = join(CODEX_HOME, 'auth.json');
+export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/codex/usage';
+// Banked "rate limit reset credits" (what `codex` shows under /limits): list +
+// consume. Consuming is the only write we ever send on the Codex side.
+export const CODEX_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+export const CODEX_RESET_CONSUME_URL = `${CODEX_RESET_CREDITS_URL}/consume`;
+export const CODEX_INTERVAL_MS = 5 * 60_000;
 
 // ─── Our state ───────────────────────────────────────────────────────────────
 export const STATE_DIR = join(HOME, '.local', 'state', 'agent-usage');

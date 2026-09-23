@@ -88,12 +88,4 @@ export function logActiveAccount(email) {
   } catch { /* best effort */ }
 }
 
-// Account logged in at time `ts` (before the first record, the first recorded account).
-export function accountAt(ts) {
-  const log = loadSwitchLog();
-  let email = log.length ? log[0].email : null;
-  for (const e of log) { if (e.t <= ts) email = e.email; else break; }
-  return email;
-}
-
 export function lastSwitchAt() { const log = loadSwitchLog(); return log.length ? log[log.length - 1].t : 0; }

@@ -1,20 +1,21 @@
 // Entry: one-shot commands, then the probe loop + TUI.
-import { statSync } from 'node:fs';
+import { statSync, unlinkSync } from 'node:fs';
 import { HELP, opts } from './cli.mjs';
 import {
-  ACTIVE_REFRESH_AHEAD_MS, CACHE_TTL_MS, CLAUDE_JSON, FIVE_H, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
-  REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS,
+  ACTIVE_REFRESH_AHEAD_MS, CACHE_FILE, CACHE_TTL_MS, CLAUDE_JSON, CODEX_INTERVAL_MS, FAIL_FILE, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
+  REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS, RESET_CONFIRM_MS,
 } from './config.mjs';
+import { consumeCodexResetCredit, countCodexProcs, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits } from './codex.mjs';
 import { archiveActive, archiveUsage, forgetAccount, listAccounts, logActiveAccount, readAccount, saveAccount } from './archive.mjs';
 import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
 import { ESC, fmtDur, paint } from './format.mjs';
-import { countClaudeProcs, localSummaryBy, scanLocal } from './local.mjs';
+import { countClaudeProcs } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } from './auto.mjs';
-import { activeIndex, cardList, render } from './render.mjs';
+import { activeIndex, cardList, render, rowList } from './render.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
-import { fetchUsage, markFail, normalize, projectRows, readCache } from './usage.mjs';
+import { bankedCount, claimReset, fetchUsage, markFail, normalize, projectRows, readCache, usableGrant } from './usage.mjs';
 
 const firstLine = e => String(e?.message || e).split('\n')[0];
 const sameEmail = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
@@ -85,6 +86,16 @@ async function runCommand() {
       : 'next: no eligible account');
     return true;
   }
+  if (opts.reset != null) {
+    if (!opts.reset) throw new Error('reset needs a target: an account email (or unique substring) or `codex`');
+    const app = createApp();
+    await app.probe(true); // fresh numbers, fresh grant list (the plain shared cache carries no grants)
+    const t = /^codex$/i.test(opts.reset) ? app.resetTargetFor({ kind: 'codex' }) : app.resetTargetFor({ kind: 'claude', email: resolveEmail(opts.reset) });
+    if (t.error) throw new Error(t.error);
+    const r = await app.useReset(t);
+    console.log(r.text);
+    process.exit(r.ok ? 0 : 1);
+  }
   return false;
 }
 
@@ -95,10 +106,16 @@ function createApp() {
   const state = {
     cred, account: loadAccount(), usage: null, usageAt: null, error: null,
     probing: false, pendingForce: false, backoffMs: 0, backoffUntil: 0, activeRefresh: null, activeRefreshTriedAt: 0,
-    localBy: new Map(), sessions: 0, others: new Map(), sel: 0, msg: null, msgAt: 0,
+    sessions: 0, others: new Map(), sel: 0, msg: null, msgAt: 0, probedAt: 0,
+    // Last banked-reset block seen for the logged-in account. A probe served
+    // from the shared cache (written by the statusline, plain endpoint) has
+    // none, so the card keeps showing this until our next own fetch.
+    resets: null, confirm: null, claiming: false,
+    codex: { auth: opts.noCodex ? null : loadCodexAuth(), usage: null, usageAt: null, error: null, lastAt: 0, backoffUntil: 0, sessions: 0, credits: null, creditsAt: null },
   };
   logActiveAccount(state.account.email);
   state.sel = activeIndex(cardList(state));
+  { const arch = state.account.email ? readAccount(state.account.email) : null; if (arch?.usage) state.resets = normalize(arch.usage).resets; }
 
   // Realtime bits: running claude sessions, and a fast check for an
   // out-of-band re-login (claude /login) so the switch log stays accurate.
@@ -109,6 +126,31 @@ function createApp() {
       if (mt !== claudeJsonMtime) { claudeJsonMtime = mt; state.account = loadAccount(); logActiveAccount(state.account.email); }
     } catch { /* no .claude.json */ }
     state.sessions = countClaudeProcs();
+    if (!opts.noCodex) state.codex.sessions = countCodexProcs();
+  }
+
+  // One account, read-only: poll the usage endpoint on its own slower cadence.
+  // Re-read auth.json each time — the Codex CLI rotates the token in place.
+  async function probeCodex(force) {
+    if (opts.noCodex) return;
+    const cx = state.codex;
+    cx.auth = loadCodexAuth();
+    if (!cx.auth) return;
+    const now = Date.now();
+    if (!force && (now - cx.lastAt < CODEX_INTERVAL_MS || now < cx.backoffUntil)) return;
+    cx.lastAt = now;
+    const r = await fetchCodexUsage(cx.auth);
+    if (r.error) {
+      cx.error = r.error;
+      cx.backoffUntil = now + Math.max(r.status === 429 ? r.retryAfterMs : 0, MIN_BACKOFF_MS);
+    } else {
+      cx.error = null; cx.backoffUntil = 0;
+      cx.usage = r.data; cx.usageAt = r.fetchedAt;
+    }
+    // The banked reset credits live on their own endpoint; same cadence.
+    const c = await fetchCodexResetCredits(cx.auth);
+    if (!c.error) { cx.credits = c.data; cx.creditsAt = c.fetchedAt; }
+    else if (!cx.error) cx.error = `resets: ${c.error}`;
   }
 
   // Refresh the logged-in account's token ourselves only when no `claude`
@@ -200,6 +242,7 @@ function createApp() {
     if (opts.json) { const { _account, ...data } = r.data; console.log(JSON.stringify(data, null, 2)); process.exit(0); }
     state.usage = normalize(r.data);
     state.usageAt = r.fetchedAt;
+    if (state.usage.resets) state.resets = state.usage.resets;
     if (email && !served) { try { archiveUsage(email, r.data, r.fetchedAt); } catch { /* best effort */ } }
   }
 
@@ -221,20 +264,73 @@ function createApp() {
         if (sameEmail(rec.email, email)) continue;
         try { await probeOther(rec, force); } catch (e) { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); }
       }
-      if (!opts.noLocal) {
-        const resets = state.usage?.sessionResetsAt ? Date.parse(state.usage.sessionResetsAt) : null;
-        const windowStart = resets && resets > Date.now() ? resets - FIVE_H : Date.now() - FIVE_H;
-        try { scanLocal(windowStart); state.localBy = localSummaryBy(email); } catch { /* best effort */ }
-      }
+      try { await probeCodex(force); } catch (e) { state.codex.error = firstLine(e); }
+      state.probedAt = Date.now();
     } finally { state.probing = false; }
     if (state.pendingForce) { state.pendingForce = false; return probe(true); }
   }
 
-  return { state, probe, pollSessions };
+  // ─── Banked resets ─────────────────────────────────────────────────────────
+  // What a `u` press (or `reset TARGET`) would spend, for a row of rowList().
+  // Returns { error } when there is nothing usable.
+  function resetTargetFor(row) {
+    const now = Date.now();
+    if (row.kind === 'codex') {
+      const cx = state.codex;
+      if (!cx.auth) return { error: 'codex: not logged in (no ~/.codex/auth.json tokens)' };
+      const resets = normalizeCodexCredits(cx.credits, now);
+      const g = usableGrant(resets, now);
+      if (!g) return cx.credits ? { error: 'codex: no banked reset credits' } : { error: 'codex: reset credits not loaded yet', notLoaded: true };
+      return { kind: 'codex', name: 'codex', auth: cx.auth, grant: g, banked: bankedCount(resets, now) };
+    }
+    if (row.kind !== 'claude') return { error: 'select an account card or the codex card first' };
+    const email = row.email;
+    const active = sameEmail(email, state.account.email);
+    let token, org, resets;
+    if (active) { token = state.cred?.accessToken; org = state.account.raw?.organizationUuid; resets = state.usage?.resets || state.resets; }
+    else {
+      const rec = readAccount(email);
+      if (!rec?.oauth?.accessToken) return { error: `${email}: no archived tokens — press l` };
+      if ((Number(rec.oauth.expiresAt) || 0) <= now) return { error: `${email}: token expired — wait for the hourly refresh or press l` };
+      token = rec.oauth.accessToken; org = rec.oauthAccount?.organizationUuid; resets = rec.usage ? normalize(rec.usage).resets : null;
+    }
+    if (!token) return { error: `${email}: not logged in` };
+    if (!org) return { error: `${email}: no organization uuid in the archive — log in once with l` };
+    if (!resets) return { error: `${email}: banked resets not loaded yet`, notLoaded: true };
+    const g = usableGrant(resets, now);
+    if (!g) return { error: `${email}: no usable banked reset${resets.reason ? ` (${resets.reason})` : ''}` };
+    return { kind: 'claude', name: email, email, active, token, org, grant: g, banked: bankedCount(resets, now) };
+  }
+
+  // Spend the target's reset. Returns { ok, text }. Never throws.
+  async function useReset(t) {
+    if (t.kind === 'codex') {
+      const r = await consumeCodexResetCredit(t.auth, t.grant.id);
+      state.codex.lastAt = 0; state.codex.backoffUntil = 0; // re-fetch quota + credits on the next probe
+      if (r.error) return { ok: false, text: `${paint.red('codex reset failed:')} ${r.error}` };
+      if (r.windowsReset > 0) return { ok: true, text: `${paint.green('codex reset used')} · ${r.windowsReset} window${r.windowsReset === 1 ? '' : 's'} reset · ${Math.max(0, t.banked - 1)} left` };
+      return { ok: false, text: `${paint.yellow('codex: nothing reset')} · server said ${r.code}` };
+    }
+    const r = await claimReset(t.token, t.org, t.grant.id);
+    for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } } // stale numbers: everyone re-fetches
+    if (t.active) { state.usage = null; state.usageAt = null; state.backoffMs = 0; state.backoffUntil = 0; }
+    else { const o = state.others.get(t.email); if (o) { o.lastAt = 0; o.backoffUntil = 0; o.backoffMs = 0; } }
+    if (r.error) return { ok: false, text: `${paint.red('reset failed:')} ${t.name} · ${r.error}` };
+    const left = r.resetsLeft != null ? `${r.resetsLeft} left` : `${Math.max(0, t.banked - 1)} left`;
+    switch (r.result) {
+      case 'reset': return { ok: true, text: `${paint.green('reset used')} on ${paint.cyan(t.name)} · cleared ${r.cleared.join('+') || 'limits'} · ${left}` };
+      case 'not_limited': return { ok: false, text: `${paint.yellow('reset kept')} · ${t.name} is not at a limit and this grant only works at one · ${left}` };
+      case 'already_used': return { ok: false, text: `${paint.yellow('reset kept')} · ${t.name}: grant already used · ${left}` };
+      case 'cooldown': return { ok: false, text: `${paint.yellow('reset kept')} · ${t.name}: cooldown${r.cooldownUntil ? ` until ${new Date(r.cooldownUntil).toLocaleTimeString()}` : ''} · ${left}` };
+      default: return { ok: false, text: `${paint.yellow('reset kept')} · ${t.name}: server said ${r.result}${r.reason ? ` (${r.reason})` : ''}` };
+    }
+  }
+
+  return { state, probe, pollSessions, resetTargetFor, useReset };
 }
 
 // ─── Live TUI ────────────────────────────────────────────────────────────────
-function runLive({ state, probe, pollSessions }) {
+function runLive({ state, probe, pollSessions, resetTargetFor, useReset }) {
   const out = process.stdout;
   const altScreen = !!out.isTTY;
   if (altScreen) out.write(`${ESC}?1049h${ESC}?25l`);
@@ -264,15 +360,41 @@ function runLive({ state, probe, pollSessions }) {
   }
 
   function doSwitch() {
-    const cards = cardList(state);
-    if (state.sel === cards.length) { // the auto-switch toggle row
+    const row = rowList(state)[state.sel];
+    if (row?.kind === 'auto') {
       const on = setAuto(!autoEnabled());
       say(on ? `${paint.green('auto-switch on')} — switches at ${AUTO_THRESHOLD}% session usage while this TUI runs` : paint.dim('auto-switch off'));
       return;
     }
-    const c = cards[state.sel];
-    if (!c || c.active) { say(paint.dim('already the logged-in account')); return; }
-    switchToEmail(c.email, 'switched to');
+    if (row?.kind === 'codex') { say(paint.dim('codex: one account, nothing to switch — u spends a banked reset')); return; }
+    if (!row || row.active) { say(paint.dim('already the logged-in account')); return; }
+    switchToEmail(row.email, 'switched to');
+  }
+
+  // `u` twice within RESET_CONFIRM_MS spends one banked reset on the selected
+  // card. Any other key in between cancels. Server-side it is Claude Code's
+  // /limit-reset claim, or Codex's credit consume.
+  function doUseReset() {
+    if (state.claiming) { say(paint.dim('a reset claim is already in flight')); return; }
+    const row = rowList(state)[state.sel];
+    const t = resetTargetFor(row || {});
+    if (t.notLoaded) { state.confirm = null; say(paint.cyan(`${t.error} — fetching, press u again in a moment`)); if (row.kind === 'codex') state.codex.lastAt = 0; reprobe(); return; }
+    if (t.error) { state.confirm = null; say(paint.yellow(t.error)); return; }
+    const key = `${t.kind}:${t.name}:${t.grant.id}`;
+    const now = Date.now();
+    if (state.confirm?.key !== key || now - state.confirm.at > RESET_CONFIRM_MS) {
+      state.confirm = { key, at: now };
+      const what = t.kind === 'codex' ? `1 of ${t.banked} codex reset credit${t.banked === 1 ? '' : 's'} (expires ${new Date(t.grant.endsAt).toLocaleDateString()})` : `1 of ${t.banked} banked reset${t.banked === 1 ? '' : 's'} on ${t.name} (clears ${t.grant.clears.join('+')})`;
+      say(`${paint.yellow('use')} ${what}? ${paint.bold('press u again')} within ${RESET_CONFIRM_MS / 1000}s to confirm`);
+      return;
+    }
+    state.confirm = null; state.claiming = true;
+    say(paint.cyan(`using reset on ${t.name}…`));
+    draw();
+    useReset(t)
+      .then(r => { say(r.text); return probe(true); })
+      .catch(e => say(`${paint.red('reset failed:')} ${firstLine(e)}`))
+      .finally(() => { state.claiming = false; draw(); });
   }
 
   // After each probe: if enabled and the active session is at the threshold,
@@ -290,8 +412,10 @@ function runLive({ state, probe, pollSessions }) {
   let loggingIn = false;
   function doLogin() {
     if (loggingIn) { say(paint.dim('login already in progress — finish it in the browser')); return; }
+    const row = rowList(state)[state.sel];
+    if (row?.kind === 'codex') { say(paint.dim('codex logs in on its own: run `codex login`')); return; }
     loggingIn = true;
-    const c = cardList(state)[state.sel];
+    const c = row?.kind === 'claude' ? row : null;
     say(paint.cyan('starting browser login…'));
     browserLogin({ onStatus: m => { say(paint.cyan(m)); draw(); } })
       .then(r => {
@@ -313,12 +437,14 @@ function runLive({ state, probe, pollSessions }) {
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.setEncoding('utf8');
     process.stdin.on('data', k => {
+      if (k !== 'u') state.confirm = null; // anything but the second `u` cancels a pending reset
       if (k === 'q' || k === '\x03') process.exit(0); // q or Ctrl-C
       else if (k === 'r') reprobe();
       else if (k === '\x1b[A' || k === 'k') state.sel = Math.max(0, state.sel - 1);
-      else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(cardList(state).length, state.sel + 1); // last index = auto-switch toggle
+      else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(rowList(state).length - 1, state.sel + 1); // last row = auto-switch toggle
       else if (k === '\r' || k === '\n') doSwitch();
       else if (k === 'l') doLogin();
+      else if (k === 'u') doUseReset();
       draw();
     });
   }
