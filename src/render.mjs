@@ -50,10 +50,32 @@ export function render(state, now) {
 
   if (!opts.once) {
     L.push('');
-    if (state.msg && now - state.msgAt < MSG_TTL_MS) L.push(state.msg);
+    if (state.msg && now - state.msgAt < MSG_TTL_MS) { L.push(...messageBox(state.msg, width)); L.push(''); }
     L.push(paint.dim('↑↓ select · enter switch · u use reset · l login · r probe · q quit'));
   }
   return L.join('\n');
+}
+
+// A one-off message (switch done, reset used, error…) in a box whose border
+// takes the message's own colour: the first SGR colour code in the text, or
+// dim when it has none. Long messages wrap on spaces inside the box.
+function messageBox(msg, width) {
+  const m = /\x1b\[(3[1-7]|9[0-7])m/.exec(msg);
+  const border = m ? (v => (opts.color ? `\x1b[${m[1]}m${v}\x1b[0m` : String(v))) : paint.dim;
+  const inner = Math.max(20, width - 4);
+  const lines = [];
+  let cur = '';
+  for (const word of msg.split(' ')) {
+    if (cur && visibleLen(cur) + 1 + visibleLen(word) > inner) { lines.push(cur); cur = word; }
+    else cur = cur ? `${cur} ${word}` : word;
+  }
+  if (cur) lines.push(cur);
+  const bar = '─'.repeat(inner + 2);
+  return [
+    border(`┌${bar}┐`),
+    ...lines.map(l => `${border('│')} ${padCol(l, inner)} ${border('│')}`),
+    border(`└${bar}┘`),
+  ];
 }
 
 function renderAutoSwitch(L, state, now, cur) {
