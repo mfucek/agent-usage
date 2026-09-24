@@ -2,7 +2,7 @@
 
 Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress, spend a banked limit reset with another. Plus a Codex (ChatGPT) card when `~/.codex/auth.json` exists.
 
-Zero dependencies. Node ≥ 18. macOS keychain or `.credentials.json`.
+Node ≥ 18. macOS keychain or `.credentials.json`. Uses `string-width` for Unicode-aware terminal painting.
 
 ```
 agent-usage                                                    probed 12s ago
@@ -44,8 +44,9 @@ Codex
 
 ```sh
 git clone <this repo> ~/Documents/agent-tooling/agent-usage
+cd ~/Documents/agent-tooling/agent-usage && npm ci
 echo 'alias agent-usage="node ~/Documents/agent-tooling/agent-usage/bin/agent-usage.mjs"' >> ~/.zshrc
-# or: cd agent-usage && npm link
+# or, from the checkout: npm link
 ```
 
 Optional: pin the card order in `~/.config/agent-usage/config.json`.
@@ -174,7 +175,10 @@ src/usage.mjs         usage endpoint, shared cache, normalisation
 src/local.mjs         running claude processes
 src/format.mjs        ANSI paint, bars, number/duration formatting
 src/render.mjs        the cards
+src/terminal.mjs      incremental physical-row repainting, ANSI/Unicode wrapping
 src/app.mjs           one-shot commands, probe loop, TUI
 ```
 
 `npm run check` syntax-checks every module and runs one `--once` probe. Honors `CLAUDE_CONFIG_DIR` and `NO_COLOR`.
+
+`npm test` checks incremental painting in a headless terminal without accessing accounts or probing APIs. Live output rewrites only changed rows, batches updates with DEC 2026 synchronized-output markers, and clears the full screen only on initialization or resize. Long lines wrap at the terminal width; rows beyond the terminal height are clipped to prevent scrolling. Enlarge the window to see more rows.

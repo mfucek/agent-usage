@@ -8,8 +8,15 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node bin/agent-usage.mjs",
+    "test": "node --test",
     "check": "node --check bin/agent-usage.mjs && for f in src/*.mjs; do node --check \"$f\" || exit 1; done && node bin/agent-usage.mjs --once --no-color >/dev/null"
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "string-width": "^7.2.0"
+  },
+  "devDependencies": {
+    "@xterm/headless": "^5.5.0"
+  }
 }

@@ -14,6 +14,7 @@ import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } from './auto.mjs';
 import { activeIndex, cardList, render, rowList } from './render.mjs';
+import { createFrameWriter } from './terminal.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
 import { bankedCount, claimReset, fetchUsage, markFail, normalize, projectRows, readCache, usableGrant } from './usage.mjs';
 
@@ -334,17 +335,12 @@ function runLive({ state, probe, pollSessions, resetTargetFor, useReset }) {
   const out = process.stdout;
   const altScreen = !!out.isTTY;
   if (altScreen) out.write(`${ESC}?1049h${ESC}?25l`);
-  process.on('exit', () => { if (altScreen) out.write(`${ESC}?25h${ESC}?1049l`); });
+  process.on('exit', () => { if (altScreen) out.write(`${ESC}?2026l${ESC}?25h${ESC}?1049l`); });
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
 
-  let lastFrame = '';
-  const draw = () => {
-    const frame = render(state, Date.now());
-    if (frame === lastFrame) return;
-    lastFrame = frame;
-    out.write(altScreen ? `${ESC}H${ESC}2J${frame}\n` : `${frame}\n\n`);
-  };
-  out.on('resize', () => { lastFrame = ''; draw(); });
+  const writer = createFrameWriter(out);
+  const draw = () => writer.write(render(state, Date.now()));
+  out.on('resize', () => { writer.invalidate(); draw(); });
   const say = m => { state.msg = m; state.msgAt = Date.now(); };
   const resetActive = () => { state.usage = null; state.usageAt = null; state.error = null; state.backoffMs = 0; state.backoffUntil = 0; state.activeRefreshTriedAt = 0; };
   const reprobe = () => probe(true).catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(draw);
