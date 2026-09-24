@@ -18,8 +18,27 @@ function gradientColor(i, width) {
   return from.map((v, k) => Math.round(v + (to[k] - v) * p));
 }
 
-export function usageBar(percent, width = 18, muted = false) {
-  if (percent == null) return `[${paint.gray('?'.repeat(width))}]`;
+// Unknown value: a skeleton — dim ░ cells with a brightness wave sliding
+// left to right, so "still loading" reads as motion instead of a question mark.
+// Anyone rendering it should redraw ~10×/s (see skeletonShown()).
+const SKELETON_STEP_MS = 90, SKELETON_PERIOD = 12;
+let skeletonAt = 0;
+export const skeletonShown = now => now - skeletonAt < 1000;
+function skeleton(width, now) {
+  skeletonAt = now;
+  if (!opts.color) return `[${'░'.repeat(width)}]`;
+  const phase = Math.floor(now / SKELETON_STEP_MS);
+  let s = '';
+  for (let i = 0; i < width; i++) {
+    const t = ((i - phase) % SKELETON_PERIOD + SKELETON_PERIOD) % SKELETON_PERIOD / SKELETON_PERIOD;
+    const v = Math.round(70 + 90 * (0.5 - 0.5 * Math.cos(2 * Math.PI * t))); // 70 → 160 → 70
+    s += paint.rgb(v, v, v, '░');
+  }
+  return `[${s}]`;
+}
+
+export function usageBar(percent, width = 18, muted = false, now = Date.now()) {
+  if (percent == null) return skeleton(width, now);
   const ratio = Math.max(0, Math.min(1, percent / 100));
   const full = Math.round(ratio * width);
   let fill = '';

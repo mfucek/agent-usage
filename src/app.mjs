@@ -8,7 +8,7 @@ import {
 import { consumeCodexResetCredit, countCodexProcs, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits } from './codex.mjs';
 import { archiveActive, archiveUsage, forgetAccount, listAccounts, logActiveAccount, readAccount, saveAccount } from './archive.mjs';
 import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
-import { ESC, fmtDur, paint } from './format.mjs';
+import { ESC, fmtDur, paint, skeletonShown } from './format.mjs';
 import { countClaudeProcs } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
@@ -457,7 +457,10 @@ function runLive({ state, probe, pollSessions, resetTargetFor, useReset }) {
   pollSessions();
   loop();
   draw();
-  setInterval(draw, 1000);
+  // Once a second for the countdowns; ~10×/s while a skeleton bar is on screen
+  // so its wave moves. draw() skips the write when nothing changed.
+  let lastDraw = 0;
+  setInterval(() => { const now = Date.now(); if (skeletonShown(now) || now - lastDraw >= 1000) { lastDraw = now; draw(); } }, 100);
   setInterval(pollSessions, PS_POLL_MS);
 }
 

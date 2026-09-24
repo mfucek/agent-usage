@@ -90,8 +90,8 @@ function quotaLine(row, now, muted = false) {
   let reset = resetTs && resetTs > now ? `  ${fmtDur(resetTs - now)}` : '';
   if (row.ended && row.window === 'session') reset = paint.gray('  ended');
   else if (row.projected) reset = paint.gray(`${reset} (reset)`);
-  const p = row.percent == null ? paint.gray('n/a') : (muted ? paint.dim(pct(row.percent).padStart(3)) : pct(row.percent).padStart(3));
-  return `  ${label(row.label)} ${usageBar(row.percent, 18, muted)} ${p}${reset}`;
+  const p = row.percent == null ? paint.gray('  –') : (muted ? paint.dim(pct(row.percent).padStart(3)) : pct(row.percent).padStart(3));
+  return `  ${label(row.label)} ${usageBar(row.percent, 18, muted, now)} ${p}${reset}`;
 }
 
 // Bars, then the three columns: Extra · Resets · Sessions.
