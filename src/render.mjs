@@ -99,7 +99,8 @@ function quotaLine(row, now, muted = false) {
   if (row.ended && row.window === 'session') reset = paint.gray('  ended');
   else if (row.projected) reset = paint.gray(`${reset} (reset)`);
   const p = row.percent == null ? paint.gray('  –') : (muted ? paint.dim(pct(row.percent).padStart(3)) : pct(row.percent).padStart(3));
-  return `  ${label(row.label)} ${usageBar(row.percent, 18, muted, now)} ${p}${reset}`;
+  const full = row.percent >= 100 ? `  ${paint.red('exhausted')}` : '';
+  return `  ${label(row.label)} ${usageBar(row.percent, 18, muted, now)} ${p}${reset}${full}`;
 }
 
 // Bars, then the three columns: Extra · Resets · Sessions.
@@ -146,7 +147,7 @@ function renderActive(L, state, now, cur) {
   const u = state.usage;
   const limited = state.error && /429/.test(state.error);
   let status;
-  if (u) { const s = accountStatus(u.rows); status = STATUS_PAINT[s](s); }
+  if (u) { const s = accountStatus(projectRows(u.rows, now)); status = STATUS_PAINT[s](s); }
   else status = limited ? paint.yellow('rate limited') : state.error ? paint.red('error') : paint.gray('probing…');
   L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))} ${paint.dim('· logged in ·')} ${status}`);
 
@@ -166,7 +167,7 @@ function renderCodex(L, state, now, cur) {
   const email = cx.usage?.email || cx.auth.email || 'codex';
   const nu = cx.usage ? normalizeCodex(cx.usage) : null;
   let status;
-  if (nu) { const s = accountStatus(nu.rows); status = STATUS_PAINT[s](s); }
+  if (nu) { const s = accountStatus(projectRows(nu.rows, now)); status = STATUS_PAINT[s](s); }
   else status = cx.error ? paint.red('error') : paint.gray('probing…');
   L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(email))} ${paint.dim('·')} ${status}`);
   if (cx.auth.expiresAt && cx.auth.expiresAt <= now) L.push(`  ${label('Token')} ${paint.yellow('expired — codex refreshes it on its next run')}`);

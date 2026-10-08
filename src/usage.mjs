@@ -66,11 +66,11 @@ export function normalize(data) {
     const k = Object.keys(data || {}).find(k => /fable/i.test(k) && data[k]?.utilization != null);
     if (k) fable = data[k];
   }
-  rows.push(bucket('Fable', fable, { dedicated: true }) || { label: 'Fable', percent: null, resetsAt: null, severity: null, dedicated: true });
+  rows.push(bucket('Fable', fable, { dedicated: true, scoped: true }) || { label: 'Fable', percent: null, resetsAt: null, severity: null, dedicated: true, scoped: true });
 
-  for (const l of scoped) if (l !== fable) rows.push(bucket(scopedName(l), l));
-  if (data?.seven_day_sonnet && !rows.some(r => r.label === 'Sonnet')) rows.push(bucket('Sonnet', data.seven_day_sonnet));
-  if (data?.seven_day_opus && !rows.some(r => r.label === 'Opus')) rows.push(bucket('Opus', data.seven_day_opus));
+  for (const l of scoped) if (l !== fable) rows.push(bucket(scopedName(l), l, { scoped: true }));
+  if (data?.seven_day_sonnet && !rows.some(r => r.label === 'Sonnet')) rows.push(bucket('Sonnet', data.seven_day_sonnet, { scoped: true }));
+  if (data?.seven_day_opus && !rows.some(r => r.label === 'Opus')) rows.push(bucket('Opus', data.seven_day_opus, { scoped: true }));
 
   const extra = data?.extra_usage || {};
   return {
@@ -201,8 +201,11 @@ export function projectRows(rows, now) {
   });
 }
 
-// Worst-bucket summary for the card header.
-export function accountStatus(rows) {
+// Card-header summary from the account-wide buckets only. A model-scoped
+// bucket (Fable, Sonnet…) at 100% locks that model, not the account; its own
+// row says so.
+export function accountStatus(allRows) {
+  const rows = allRows.filter(r => !r.scoped);
   const ps = rows.map(r => r.percent).filter(p => p != null);
   if (!ps.length) return 'unknown';
   if (ps.some(p => p >= 100)) return 'exhausted';
