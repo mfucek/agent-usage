@@ -37,7 +37,9 @@ Codex
            Extra      Resets       Sessions
            –          ⟲ 3 · 10d    1
 
-↑↓ select · enter switch · u use reset · l login · r probe · q quit
+  [ ] auto use reset · ≥95% · reset ≥1d away
+
+↑↓ select · enter switch/toggle · u use reset · l login · r probe · q quit
 ```
 
 ## Install
@@ -77,11 +79,12 @@ agent-usage login            # browser login (PKCE), archive + activate
 agent-usage auto [on|off]    # show or set auto-switch (see below)
 agent-usage reset EMAIL      # spend one banked limit reset on that Claude account (no confirmation)
 agent-usage reset codex      # spend one Codex reset credit
+agent-usage auto-reset [on|off] # show or set Codex auto use reset
 ```
 
 `select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
 
-Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle auto-switch) · `u` use a banked reset on the selected card (press twice) · `l` browser login · `r` probe now · `q` quit.
+Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle automation) · `u` use a banked reset on the selected card (press twice) · `l` browser login · `r` probe now · `q` quit.
 
 ## Auto-switch
 
@@ -92,6 +95,14 @@ The line after the Claude cards is a toggle (also `agent-usage auto on|off`, per
 ```
 
 While the TUI is running, each probe checks the logged-in account; at ≥90% session usage it switches to the account with session <90%, Fable <90%, a live refresh token, and the **nearest session reset** (an idle account counts as a full 5h away). The name after the arrow is always who that would be (`none eligible` when nobody qualifies); `agent-usage auto` prints the same with the numbers. The threshold is `"autoThreshold"` in the config. Nothing switches when the TUI isn't running.
+
+## Codex auto use reset
+
+Select the `auto use reset` line below the Codex card and press `Enter`, or run `agent-usage auto-reset on` to enable it. It defaults to off and persists as `"codexAutoReset": true` in the config file. `agent-usage auto-reset` shows the setting; `agent-usage auto-reset off` disables it. Running TUIs pick up setting changes on their next polling heartbeat (normally within a second, or when an in-flight probe finishes).
+
+While live mode runs, a successful Codex probe automatically spends the soonest-expiring usable credit when **the same main usage window is at least 95% used and its reset is at least 24 hours away**. Both boundaries are inclusive. Usage and credits must both have been freshly fetched; missing credits, expired authentication, failed probes, or an active manual reset confirmation prevent an automatic claim. With automation enabled, Codex checks every **30 seconds** on its own timer, independently of Claude backoff, slow Claude probes, and `-i`. The toggle shows the next check countdown. With automation off it polls every 5 minutes; `r` probes immediately. Transient probe failures retry on the next 30-second check; server `Retry-After` delays are respected. Triggering depends on the usage endpoint reporting the threshold, so a sudden usage spike can still reach the limit between checks. Usage and credits refresh again after a claim, and the result appears in the dashboard.
+
+Successful claims block duplicate spending for that high-usage window until a fresh snapshot shows recovery or a different reset date. Failed claims retry after 60 seconds (or a longer server `Retry-After`), using fresh usage and credit reads and only the **same still-usable credit**. An uncertain response keeps the same redemption request ID; a definite no-op gets a new request ID. If the credit disappears or is being redeemed, automation waits instead of spending another credit. This guard also covers manual resets and lasts for the live process. Automation does not run for `status`, `--once`, `json`, explicit `reset` commands, or with `--no-codex`.
 
 ## The rows
 
@@ -122,7 +133,7 @@ The logged-in card can lag: a probe served from the shared cache (written by the
 
 ## The Codex card
 
-When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, one extra card shows Codex quota: `GET chatgpt.com/backend-api/codex/usage` — the endpoint `codex` itself polls for its rate-limit display — probed every 5 minutes, together with the banked reset credits. Rows are the account's main rate-limit windows (a ≤6h window renders like a Session, a 7d one like Weekly; separately-metered extras like Spark are not shown), then the same columns as a Claude card: `Extra` (always `–`), `Resets`, and `Sessions` = running `codex` processes (daemons like `codex app-server` excluded). The auth file is never written and the token never refreshed — the Codex CLI does that itself on its next run; the only write is the reset consume behind `u`. One account only; no switching. Hide it with `--no-codex`.
+When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, one extra card shows Codex quota: `GET chatgpt.com/backend-api/codex/usage` — the endpoint `codex` itself polls for its rate-limit display — probed every 5 minutes (every 30 seconds with auto use reset enabled), together with the banked reset credits. Rows are the account's main rate-limit windows (a ≤6h window renders like a Session, a 7d one like Weekly; separately-metered extras like Spark are not shown), then the same columns as a Claude card: `Extra` (always `–`), `Resets`, and `Sessions` = running `codex` processes (daemons like `codex app-server` excluded). The auth file is never written and the token never refreshed — the Codex CLI does that itself on its next run; the only write is consuming a reset via `u`, `reset codex`, or the optional auto use reset toggle. One account only; no switching. Hide it with `--no-codex`.
 
 ## Multiple accounts
 
@@ -173,6 +184,7 @@ src/oauth.mjs         token refresh, browser PKCE login, profile
 src/switch.mjs        switchTo / storeLogin
 src/usage.mjs         usage endpoint, shared cache, normalisation
 src/local.mjs         running claude processes
+src/codex-auto.mjs    Codex auto reset setting, thresholds, repeat-claim guard
 src/format.mjs        ANSI paint, bars, number/duration formatting
 src/render.mjs        the cards
 src/terminal.mjs      incremental physical-row repainting, ANSI/Unicode wrapping
@@ -181,4 +193,4 @@ src/app.mjs           one-shot commands, probe loop, TUI
 
 `npm run check` syntax-checks every module and runs one `--once` probe. Honors `CLAUDE_CONFIG_DIR` and `NO_COLOR`.
 
-`npm test` checks incremental painting in a headless terminal without accessing accounts or probing APIs. Live output rewrites only changed rows, batches updates with DEC 2026 synchronized-output markers, and clears the full screen only on initialization or resize. Long lines wrap at the terminal width; rows beyond the terminal height are clipped to prevent scrolling. Enlarge the window to see more rows.
+`npm test` checks incremental painting in a headless terminal and Codex automatic resets (thresholds, persistence, fresh probes, and duplicate-claim protection), using isolated files and mocked APIs. Live output rewrites only changed rows, batches updates with DEC 2026 synchronized-output markers, and clears the full screen only on initialization or resize. Long lines wrap at the terminal width; rows beyond the terminal height are clipped to prevent scrolling. Enlarge the window to see more rows.

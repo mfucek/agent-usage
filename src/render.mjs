@@ -7,6 +7,7 @@ import { fmtAge, fmtDur, label, paint, pct, usageBar } from './format.mjs';
 import { accountStatus, bankedCount, normalize, projectRows } from './usage.mjs';
 import { autoEnabled, pickCandidate } from './auto.mjs';
 import { normalizeCodex, normalizeCodexCredits } from './codex.mjs';
+import { CODEX_AUTO_THRESHOLD, codexAutoEnabled } from './codex-auto.mjs';
 
 const PLACEHOLDER_ROWS = ['Session', 'Weekly', 'Fable'];
 const STATUS_PAINT = { ok: paint.green, 'near limit': paint.yellow, exhausted: paint.red, unknown: paint.gray };
@@ -22,11 +23,12 @@ export function cardList(state) {
 export const activeIndex = cards => Math.max(0, cards.findIndex(c => c.active));
 
 // Everything the cursor can land on, top to bottom: the Claude cards, the
-// auto-switch line, and the Codex card (when present). `state.sel` indexes this.
+// auto-switch line, and the Codex card and reset toggle (when present).
+// `state.sel` indexes this.
 export function rowList(state) {
   const rows = cardList(state).map(c => ({ kind: 'claude', ...c }));
   rows.push({ kind: 'auto' });
-  if (state.codex?.auth) rows.push({ kind: 'codex' });
+  if (state.codex?.auth) rows.push({ kind: 'codex' }, { kind: 'codex-auto' });
   return rows;
 }
 
@@ -46,12 +48,18 @@ export function render(state, now) {
     if (r.kind === 'claude') { r.active ? renderActive(L, state, now, cursor(i)) : renderArchived(L, state, now, cursor(i), r); L.push(''); }
     else if (r.kind === 'auto') renderAutoSwitch(L, state, now, cursor(i));
     else if (r.kind === 'codex') { L.push(''); L.push(paint.bold('Codex')); renderCodex(L, state, now, cursor(i)); }
+    else if (r.kind === 'codex-auto') {
+      const on = codexAutoEnabled();
+      L.push('');
+      L.push(`${cursor(i)} ${on ? paint.green('[x]') : paint.dim('[ ]')} auto use reset · ≥${CODEX_AUTO_THRESHOLD}% · reset ≥1d away`);
+      if (on && !opts.once) L.push(paint.dim(`      next check ${fmtDur(Math.max(0, (state.codex.nextProbeAt || now) - now))}`));
+    }
   });
 
   if (!opts.once) {
     L.push('');
     if (state.msg && now - state.msgAt < MSG_TTL_MS) { L.push(...messageBox(state.msg, width)); L.push(''); }
-    L.push(paint.dim('↑↓ select · enter switch · u use reset · l login · r probe · q quit'));
+    L.push(paint.dim('↑↓ select · enter switch/toggle · u use reset · l login · r probe · q quit'));
   }
   return L.join('\n');
 }

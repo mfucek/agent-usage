@@ -1,5 +1,5 @@
-// Codex (ChatGPT) side: read-only visual. auth.json is never written — the
-// Codex CLI refreshes its own token; we just read it and poll the usage endpoint.
+// Codex (ChatGPT) usage and banked resets. auth.json is never written — the
+// Codex CLI refreshes its own token; we read it to poll usage or spend a reset.
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -90,7 +90,8 @@ export function normalizeCodexCredits(data, now = Date.now()) {
 // `windows_reset > 0` is the success signal, `code` the server's word.
 export async function consumeCodexResetCredit(auth, creditId, o = {}) {
   if (!/^[A-Za-z0-9_-]{1,80}$/.test(creditId || '')) return { error: 'no usable credit' };
-  const r = await codexFetch(auth, CODEX_RESET_CONSUME_URL, { ...o, method: 'POST', body: { credit_id: creditId, redeem_request_id: randomUUID() }, timeoutMs: 25_000 });
+  const { requestId = randomUUID(), ...fetchOptions } = o;
+  const r = await codexFetch(auth, CODEX_RESET_CONSUME_URL, { ...fetchOptions, method: 'POST', body: { credit_id: creditId, redeem_request_id: requestId }, timeoutMs: 25_000 });
   if (r.error) return r;
   const d = r.data || {};
   return { code: d.code || 'unknown', windowsReset: Number(d.windows_reset) || 0, credit: d.credit || null };

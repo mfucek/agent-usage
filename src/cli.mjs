@@ -5,7 +5,7 @@ const argv = process.argv.slice(2);
 // Subcommand sugar: `agent-usage list`, `agent-usage select <email>`, … map
 // onto the flags below so scripts get a non-TUI interface without the dashes.
 const SUB_FLAG = { list: 'accounts', accounts: 'accounts', login: 'login', status: 'once', json: 'json', whoami: 'whoami', current: 'whoami', help: 'help' };
-const SUB_ARG = { select: 'switchTo', switch: 'switchTo', forget: 'forget', auto: 'auto', reset: 'reset' };
+const SUB_ARG = { select: 'switchTo', switch: 'switchTo', forget: 'forget', auto: 'auto', 'auto-reset': 'autoReset', reset: 'reset' };
 const sub = {};
 if (argv[0] && !argv[0].startsWith('-')) {
   const cmd = argv.shift();
@@ -38,6 +38,9 @@ commands (one-shot, script-friendly):
                    the nearest session reset (acts only while the TUI runs)
   reset TARGET     spend one banked limit reset now. TARGET is a Claude account
                    email (or unique substring) or \`codex\`. No confirmation.
+  auto-reset [on|off] show or set Codex auto use reset: usage >=95% and that
+                   window's reset >=1 day away (checks every 30s in live mode;
+                   setting changes also apply to an already-running TUI)
 
 options:
   -i, --interval N probe interval in seconds (min 30, default 60)
@@ -57,8 +60,9 @@ config (~/.config/agent-usage/config.json):
   { "order": ["a@x.com", "b@y.com"] }   fixed card order; others follow, newest first
   { "autoSwitch": true }                auto-switch on (the TUI toggle writes this)
   { "autoThreshold": 90 }               auto-switch trigger/eligibility percent
+  { "codexAutoReset": true }            Codex auto use reset on (default off)
 
-live keys: ↑/↓ select · enter switch (or toggle auto-switch) · u use a banked reset on the
+live keys: ↑/↓ select · enter switch (or toggle automation) · u use a banked reset on the
 selected card (press twice) · l login in browser · r probe now · q quit`;
 
 export const opts = {
@@ -74,5 +78,6 @@ export const opts = {
   switchTo: sub.switchTo ?? (has('--switch') ? opt('--switch', '') : null),
   forget: sub.forget ?? (has('--forget') ? opt('--forget', '') : null),
   auto: sub.auto ?? null,
+  autoReset: sub.autoReset ?? null,
   reset: sub.reset ?? null,
 };
