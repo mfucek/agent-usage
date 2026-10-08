@@ -17,7 +17,7 @@ import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } fro
 import { activeIndex, cardList, render, rowList } from './render.mjs';
 import { createFrameWriter } from './terminal.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
-import { bankedCount, claimReset, fetchUsage, markFail, normalize, projectRows, readCache, usableGrant } from './usage.mjs';
+import { bankedCount, claimReset, fetchUsage, markFail, mergeLive, normalize, projectRows, readCache, usableGrant } from './usage.mjs';
 
 const firstLine = e => String(e?.message || e).split('\n')[0];
 const sameEmail = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
@@ -125,7 +125,7 @@ export function createApp({ live = false } = {}) {
   try { cred = loadCredentials(); } catch { /* nobody logged in: archived cards still work */ }
   const state = {
     cred, account: loadAccount(), usage: null, usageAt: null, error: null,
-    probing: false, pendingForce: false, backoffMs: 0, backoffUntil: 0, activeRefresh: null, activeRefreshTriedAt: 0,
+    probing: false, pendingForce: false, backoffMs: 0, backoffUntil: 0, failedAt: 0, liveSince: 0, activeRefresh: null, activeRefreshTriedAt: 0,
     sessions: 0, others: new Map(), sel: 0, msg: null, msgAt: 0, probedAt: 0,
     // Last banked-reset block seen for the logged-in account. A probe served
     // from the shared cache (written by the statusline, plain endpoint) has
@@ -146,6 +146,7 @@ export function createApp({ live = false } = {}) {
       if (mt !== claudeJsonMtime) { claudeJsonMtime = mt; state.account = loadAccount(); logActiveAccount(state.account.email); }
     } catch { /* no .claude.json */ }
     state.sessions = countClaudeProcs();
+    state.usage = mergeLive(state.usage, Date.now(), state.liveSince);
     if (!opts.noCodex) state.codex.sessions = countCodexProcs();
   }
 
@@ -278,14 +279,18 @@ export function createApp({ live = false } = {}) {
     if (!cred?.accessToken) { state.error = 'not logged in — press l or switch to an archived account'; return; }
     // Prefer a fresh shared cache (statusline or another agent-usage may have
     // just fetched). Only hit the network when it is stale or missing.
+    // While a 429 backoff runs, only the network call waits: a cache someone
+    // else wrote since is still taken, and the live feed keeps the bars moving.
     const cached = force ? null : readCache(email);
     let r, served = false;
     if (cached && t0 - cached.fetchedAt < CACHE_TTL_MS) { r = cached; served = true; }
-    else if (!force && cached && state.backoffMs && t0 < state.backoffUntil) { r = cached; served = true; } // still backing off: show stale
-    else r = await fetchUsage(cred.accessToken, { cacheAs: email });
+    else if (!force && t0 < state.backoffUntil) {
+      if (!cached || cached.fetchedAt <= (state.usageAt || 0)) return;
+      r = cached; served = true;
+    } else r = await fetchUsage(cred.accessToken, { cacheAs: email });
 
     if (r.error) {
-      state.error = r.error;
+      state.error = r.error; state.failedAt = Date.now();
       markFail();
       if (r.status === 429) { state.backoffMs = backoff(state.backoffMs, r.retryAfterMs); state.backoffUntil = Date.now() + state.backoffMs; }
       // Fall back to whatever the last good response was (ours, statusline's, or the archive).
@@ -296,9 +301,10 @@ export function createApp({ live = false } = {}) {
       if (opts.json) { console.error(r.error); process.exit(1); }
       return;
     }
-    if (!served) { state.error = null; state.backoffMs = 0; state.backoffUntil = 0; } // a served cache does not clear a live backoff
+    // A cache fetched after our last failure means the endpoint answers again.
+    if (!served || r.fetchedAt > state.failedAt) { state.error = null; state.backoffMs = 0; state.backoffUntil = 0; }
     if (opts.json) { const { _account, ...data } = r.data; console.log(JSON.stringify(data, null, 2)); process.exit(0); }
-    state.usage = normalize(r.data);
+    state.usage = mergeLive(normalize(r.data), Date.now(), state.liveSince);
     state.usageAt = r.fetchedAt;
     if (state.usage.resets) state.resets = state.usage.resets;
     if (email && !served) { try { archiveUsage(email, r.data, r.fetchedAt); } catch { /* best effort */ } }
@@ -380,7 +386,7 @@ export function createApp({ live = false } = {}) {
     }
     const r = await claimReset(t.token, t.org, t.grant.id);
     for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } } // stale numbers: everyone re-fetches
-    if (t.active) { state.usage = null; state.usageAt = null; state.backoffMs = 0; state.backoffUntil = 0; }
+    if (t.active) { state.usage = null; state.usageAt = null; state.backoffMs = 0; state.backoffUntil = 0; state.liveSince = Date.now(); }
     else { const o = state.others.get(t.email); if (o) { o.lastAt = 0; o.backoffUntil = 0; o.backoffMs = 0; } }
     if (r.error) return { ok: false, text: `${paint.red('reset failed:')} ${t.name} · ${r.error}` };
     const left = r.resetsLeft != null ? `${r.resetsLeft} left` : `${Math.max(0, t.banked - 1)} left`;
@@ -526,7 +532,7 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
     probe().catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(() => {
       maybeAutoSwitch();
       draw();
-      nextProbeAt = Date.now() + (state.backoffMs || opts.intervalMs);
+      nextProbeAt = Date.now() + opts.intervalMs; // a 429 backoff only holds the logged-in account's fetch
     });
   }
   pollSessions();

@@ -1,7 +1,8 @@
 // The zero-spend usage endpoint, the shared on-disk cache, and response normalisation.
 import { randomUUID } from 'node:crypto';
-import { readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { CACHE_FILE, CLI_HEADERS, FAIL_FILE, OAUTH_BETA, RESET_PROGRAM, USAGE_QUERY, USAGE_URL, WEEK_MS, resetUrl } from './config.mjs';
+import { readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { CACHE_FILE, CLI_HEADERS, FAIL_FILE, LIVE_DIR, LIVE_MAX_AGE_MS, OAUTH_BETA, RESET_PROGRAM, USAGE_QUERY, USAGE_URL, WEEK_MS, resetUrl } from './config.mjs';
 
 const num = v => (v == null || Number.isNaN(Number(v)) ? null : Number(v));
 
@@ -148,6 +149,43 @@ export async function claimReset(accessToken, orgUuid, grantId, { timeoutMs = 25
   } catch (err) {
     return { error: err?.name === 'AbortError' ? 'claim timed out' : (err?.message || String(err)) };
   } finally { clearTimeout(t); }
+}
+
+// Fold the statusline's live numbers (see LIVE_DIR) into the Session and
+// Weekly rows. They carry no account, so the weekly reset fingerprints it: a
+// file counts only when its 7d window resets within an hour of this account's.
+// Usage only grows within a window, so the latest window's highest figure is
+// the newest. Files written before `since` (a reset claim) are ignored.
+const SAME_WINDOW_MS = 10 * 60_000;
+export function mergeLive(usage, now = Date.now(), since = 0, dir = LIVE_DIR) {
+  const weekly = usage && projectRows(usage.rows, now).find(r => r.label === 'Weekly');
+  const wk = weekly?.resetsAt ? Date.parse(weekly.resetsAt) : 0;
+  if (!wk) return usage;
+  const live = [];
+  let files = [];
+  try { files = readdirSync(dir).filter(f => f.endsWith('.json')); } catch { return usage; }
+  for (const f of files) {
+    try {
+      const p = join(dir, f), mt = statSync(p).mtimeMs;
+      if (now - mt > LIVE_MAX_AGE_MS || mt < since) continue;
+      const j = JSON.parse(readFileSync(p, 'utf8'));
+      if (Math.abs(Number(j?.seven_day?.resets_at) * 1000 - wk) <= 3600_000) live.push(j);
+    } catch { /* half-written or gone */ }
+  }
+  if (!live.length) return usage;
+  const merge = (row, key) => {
+    const c = live.map(j => j[key]).filter(b => b && Number.isFinite(Number(b.used_percentage)) && Number(b.resets_at) > 0)
+      .map(b => ({ percent: Number(b.used_percentage), t: Number(b.resets_at) * 1000 }));
+    if (!c.length) return row;
+    if (row?.percent != null && row.resetsAt) c.push({ percent: row.percent, t: Date.parse(row.resetsAt), own: true });
+    const latest = Math.max(...c.map(x => x.t));
+    const win = c.filter(x => x.t >= latest - SAME_WINDOW_MS);
+    const percent = Math.max(...win.map(x => x.percent));
+    const resetsAt = win.some(x => x.own) ? row.resetsAt : new Date(latest).toISOString();
+    return row ? (row.percent === percent && row.resetsAt === resetsAt ? row : { ...row, percent, resetsAt }) : null;
+  };
+  const rows = usage.rows.map(r => r.window === 'session' ? merge(r, 'five_hour') : r.label === 'Weekly' ? merge(r, 'seven_day') : r);
+  return rows.every((r, i) => r === usage.rows[i]) ? usage : { ...usage, rows, sessionResetsAt: rows.find(r => r.window === 'session')?.resetsAt || null };
 }
 
 // Age stale rows: once a bucket's reset moment has passed, its bar is empty.

@@ -87,6 +87,10 @@ export const CONFIG_FILE = join(process.env.XDG_CONFIG_HOME || join(HOME, '.conf
 // `_account` so a cache left over from another account is never shown.
 export const CACHE_FILE = '/tmp/.claude-usage-cache';
 export const FAIL_FILE = `${CACHE_FILE}.fail`; // statusline's negative-cache stamp
+// Per-session 5h/7d numbers the statusline saves from Claude Code's stdin
+// (`rate_limits`, read off API response headers): live and never rate limited.
+export const LIVE_DIR = '/tmp/.claude-usage-live';
+export const LIVE_MAX_AGE_MS = 5 * 3600_000;
 export const CACHE_TTL_MS = 120_000;
 export const MIN_BACKOFF_MS = 5 * 60_000;
 export const MAX_BACKOFF_MS = 30 * 60_000;
