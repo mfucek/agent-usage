@@ -23,6 +23,15 @@ const firstLine = e => String(e?.message || e).split('\n')[0];
 const sameEmail = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 const backoff = (prev, retryAfterMs) => Math.max(retryAfterMs || 0, Math.min((prev || MIN_BACKOFF_MS / 2) * 2, MAX_BACKOFF_MS));
 
+// A probe that never settles froze polling for good (seen 2026-10-08: probing
+// stuck, no socket, no pending abort timer). Every probe now settles within
+// PROBE_DEADLINE_MS, worst-case legit runs (refreshes + reset claim) included.
+const PROBE_DEADLINE_MS = 120_000;
+function within(p, ms, what) {
+  let t;
+  const late = new Promise((_, reject) => { t = setTimeout(() => reject(new Error(`${what} stuck for ${ms / 1000}s — abandoned`)), ms); });
+  return Promise.race([p, late]).finally(() => clearTimeout(t));
+}
 
 // Accept a partial email for select/forget: an exact match wins, otherwise a
 // unique case-insensitive substring of an archived account's email.
@@ -144,8 +153,8 @@ export function createApp({ live = false } = {}) {
   let codexProbe = null;
   function probeCodex(force = false) {
     if (codexProbe) return codexProbe;
-    codexProbe = doProbeCodex(force).finally(() => { codexProbe = null; });
-    return codexProbe;
+    const p = within(doProbeCodex(force), PROBE_DEADLINE_MS, 'codex probe').finally(() => { if (codexProbe === p) codexProbe = null; });
+    return (codexProbe = p);
   }
 
   // Poll faster while automation is enabled; claims require fresh probes.
@@ -295,29 +304,35 @@ export function createApp({ live = false } = {}) {
     if (email && !served) { try { archiveUsage(email, r.data, r.fetchedAt); } catch { /* best effort */ } }
   }
 
+  // `probing` is a generation number, so an abandoned probe that wakes up late
+  // cannot clear the flag of the one that replaced it.
+  let probeGen = 0;
   async function probe(force = false) {
     if (state.probing) { if (force) state.pendingForce = true; return; }
-    state.probing = true;
+    const gen = state.probing = ++probeGen;
     // Start Codex before awaiting any Claude network work.
     const codexTask = probeCodex(force).catch(e => { state.codex.error = firstLine(e); });
-    try {
-      // Re-read credentials/account each probe so a re-login (different account)
-      // is picked up without restarting.
-      try { state.cred = loadCredentials(); } catch { state.cred = {}; }
-      state.account = loadAccount();
-      const { email } = state.account;
-      logActiveAccount(email);
-      await maybeRefreshActive();
-      const cred = state.cred;
-      try { archiveActive(cred, state.account); } catch { /* best effort */ }
-      await probeActive(force, email, cred);
-      for (const rec of listAccounts()) {
-        if (sameEmail(rec.email, email)) continue;
-        try { await probeOther(rec, force); } catch (e) { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); }
-      }
-      state.probedAt = Date.now();
-    } finally { await codexTask; state.probing = false; }
+    try { await within(probeClaude(force), PROBE_DEADLINE_MS, 'claude probe'); }
+    finally { if (state.probing === gen) state.probing = 0; await codexTask; } // codexTask has its own deadline
     if (state.pendingForce) { state.pendingForce = false; return probe(true); }
+  }
+
+  async function probeClaude(force) {
+    // Re-read credentials/account each probe so a re-login (different account)
+    // is picked up without restarting.
+    try { state.cred = loadCredentials(); } catch { state.cred = {}; }
+    state.account = loadAccount();
+    const { email } = state.account;
+    logActiveAccount(email);
+    await maybeRefreshActive();
+    const cred = state.cred;
+    try { archiveActive(cred, state.account); } catch { /* best effort */ }
+    await probeActive(force, email, cred);
+    for (const rec of listAccounts()) {
+      if (sameEmail(rec.email, email)) continue;
+      try { await probeOther(rec, force); } catch (e) { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); }
+    }
+    state.probedAt = Date.now();
   }
 
   // ─── Banked resets ─────────────────────────────────────────────────────────
@@ -502,14 +517,22 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
     });
   }
 
-  const loop = () => probe().catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(() => {
-    maybeAutoSwitch();
-    draw();
-    setTimeout(loop, state.backoffMs || opts.intervalMs).unref?.();
-  });
+  // Due times are wall-clock and checked every second: a long setTimeout
+  // drifts across macOS sleep (its clock pauses) and dies with its probe.
+  let nextProbeAt = 0;
+  function tick() {
+    if (state.probing || Date.now() < nextProbeAt) return;
+    nextProbeAt = Date.now() + opts.intervalMs;
+    probe().catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(() => {
+      maybeAutoSwitch();
+      draw();
+      nextProbeAt = Date.now() + (state.backoffMs || opts.intervalMs);
+    });
+  }
   pollSessions();
   if (!opts.noCodex) startCodexPolling(probeCodex, e => { state.codex.error = firstLine(e); });
-  loop();
+  tick();
+  setInterval(tick, 1000);
   draw();
   // Once a second for the countdowns; ~10×/s while a skeleton bar is on screen
   // so its wave moves. draw() skips the write when nothing changed.
