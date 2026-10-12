@@ -2,54 +2,98 @@
 
 Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress, spend a banked limit reset with another. Plus a Codex (ChatGPT) card when `~/.codex/auth.json` exists.
 
-Node ≥ 18. macOS keychain or `.credentials.json`. Uses `string-width` for Unicode-aware terminal painting.
+## Screenshot
 
 ```
-agent-usage                                                    probed 12s ago
-
-Claude
-  ○ matija@example.com · 4h · live
-  Session  [██████████████████] 98%  1h2m
-  Weekly   [███░░░░░░░░░░░░░░░] 16%  6d7h
-  Fable    [███░░░░░░░░░░░░░░░] 16%  6d7h
-           Extra      Resets       Sessions
-           off        ⟲ –          0
-
-> ● luka@example.com · logged in · ok
-  Session  [████░░░░░░░░░░░░░░] 20%  2m
-  Weekly   [█░░░░░░░░░░░░░░░░░]  8%  5d17h
-  Fable    [███░░░░░░░░░░░░░░░] 14%  5d17h
-           Extra      Resets       Sessions
-           off        ⟲ 1 · 29d    7
-
-  ○ nino@example.com · 1h · last known · token expired
-  Session  [░░░░░░░░░░░░░░░░░░]  0%  ended
-  Weekly   [█████████░░░░░░░░░] 50%  2d
-  Fable    [░░░░░░░░░░░░░░░░░░]  0%  6d21h (reset)
-           Extra      Resets       Sessions
-           off        ⟲ 1 · 29d    0
-
-  [x] auto-switch → matija
-
-Codex
-  ● matija@example.com · ok
-  Weekly   [░░░░░░░░░░░░░░░░░░]  0%  6d23h
-           Extra      Resets       Sessions
-           –          ⟲ 3 · 10d    1
-
-  [ ] auto use reset · ≥95% · reset ≥1d away
-
-↑↓ select · enter switch/toggle · u use reset · l login · r probe · q quit
+┌─ agent-usage ──────────────────────────────────────────────────────────────┐
+│ agent-usage                                                 probed 12s ago │
+│                                                                            │
+│ Claude                                                                     │
+│   ○ matija@example.com · 4h · live                                         │
+│   Session  [██████████████████] 98%  1h2m                                  │
+│   Weekly   [███░░░░░░░░░░░░░░░] 16%  6d7h                                  │
+│   Fable    [███░░░░░░░░░░░░░░░] 16%  6d7h                                  │
+│            Extra      Resets       Sessions                                │
+│            off        ⟲ –          0                                       │
+│                                                                            │
+│ > ● luka@example.com · logged in · ok                                      │
+│   Session  [████░░░░░░░░░░░░░░] 20%  2m                                    │
+│   Weekly   [█░░░░░░░░░░░░░░░░░]  8%  5d17h                                 │
+│   Fable    [███░░░░░░░░░░░░░░░] 14%  5d17h                                 │
+│            Extra      Resets       Sessions                                │
+│            off        ⟲ 1 · 29d    7                                       │
+│                                                                            │
+│   ○ nino@example.com · 1h · last known · token expired                     │
+│   Session  [░░░░░░░░░░░░░░░░░░]  0%  ended                                 │
+│   Weekly   [█████████░░░░░░░░░] 50%  2d                                    │
+│   Fable    [░░░░░░░░░░░░░░░░░░]  0%  6d21h (reset)                         │
+│            Extra      Resets       Sessions                                │
+│            off        ⟲ 1 · 29d    0                                       │
+│                                                                            │
+│   [x] auto-switch → matija                                                 │
+│                                                                            │
+│ Codex                                                                      │
+│   ● matija@example.com · ok                                                │
+│   Weekly   [░░░░░░░░░░░░░░░░░░]  0%  6d23h                                 │
+│            Extra      Resets       Sessions                                │
+│            –          ⟲ 3 · 10d    1                                       │
+│                                                                            │
+│   [ ] auto use reset · ≥95% · reset ≥1d away                               │
+│                                                                            │
+│ ↑↓ select · enter switch/toggle · u use reset · l login · r probe · q quit │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
+
+`●` = logged in now, `○` = archived account, `>` = selected card. Bars are a green → yellow → red gradient, so a fuller bar reaches further into red.
 
 ## Install
 
-```sh
-git clone <this repo> ~/Documents/agent-tooling/agent-usage
-cd ~/Documents/agent-tooling/agent-usage && npm ci
-echo 'alias agent-usage="node ~/Documents/agent-tooling/agent-usage/bin/agent-usage.mjs"' >> ~/.zshrc
-# or, from the checkout: npm link
-```
+**Requirements**
+
+- Node.js ≥ 18 (`node --version`)
+- Claude Code, logged in at least once (`claude /login`)
+- macOS (tokens in the keychain) or Linux (tokens in `~/.claude/.credentials.json`)
+- Optional: the Codex CLI, logged in with ChatGPT, for the Codex card
+
+**Steps**
+
+1. Clone and install dependencies:
+
+   ```sh
+   git clone https://github.com/mfucek/agent-usage.git
+   cd agent-usage
+   npm ci
+   ```
+
+2. Put `agent-usage` on your `PATH` (pick one):
+
+   ```sh
+   npm link                      # global symlink to this checkout
+   # or
+   echo "alias agent-usage=\"node $PWD/bin/agent-usage.mjs\"" >> ~/.zshrc && source ~/.zshrc
+   ```
+
+3. Check it works:
+
+   ```sh
+   agent-usage --once
+   ```
+
+   You should see one card for the account Claude Code is logged into.
+
+4. Run the live dashboard:
+
+   ```sh
+   agent-usage
+   ```
+
+5. Add more accounts: press `l` in the dashboard (browser login), or run `claude /login` with another account while the dashboard is open. Each account gets its own card and stays there.
+
+**Update:** `git pull && npm ci` in the checkout.
+
+**Uninstall:** `npm unlink -g agent-usage` (or remove the alias), delete the checkout, and optionally `rm -rf ~/.local/state/agent-usage ~/.config/agent-usage` (archived account tokens and settings).
+
+## Configuration
 
 Optional: pin the card order in `~/.config/agent-usage/config.json`.
 
