@@ -7,7 +7,7 @@ const wrap = code => v => opts.color ? `${ESC}${code}m${v}${RESET}` : String(v);
 
 export const paint = {
   rgb: (r, g, b, v) => opts.color ? `${ESC}38;2;${r};${g};${b}m${v}${RESET}` : String(v),
-  bold: wrap(1), dim: wrap(2), gray: wrap(90), green: wrap(32), yellow: wrap(33), red: wrap(31), cyan: wrap(36),
+  bold: wrap(1), dim: wrap(2), reverse: wrap(7), gray: wrap(90), green: wrap(32), yellow: wrap(33), red: wrap(31), cyan: wrap(36),
 };
 
 function gradientColor(i, width) {
@@ -16,6 +16,32 @@ function gradientColor(i, width) {
   const to = t < 0.5 ? [245, 185, 40] : [239, 68, 68];
   const p = t < 0.5 ? t * 2 : (t - 0.5) * 2;
   return from.map((v, k) => Math.round(v + (to[k] - v) * p));
+}
+
+// Moving rainbow (from xfarm's update banner): hue shifts along the text and
+// cycles every 4s, so callers redraw ~10×/s while one is on screen.
+function rainbow(i, total, now) {
+  const h = ((now / 4000) % 1 + (i / Math.max(1, total)) * 0.35) % 1;
+  const s = 0.85, l = 0.62, a = s * Math.min(l, 1 - l);
+  const f = n => { const k = (n + h * 12) % 12; return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))); };
+  return [f(0), f(8), f(4)];
+}
+export const gradientText = (text, now) => [...text].map((ch, i, all) => paint.rgb(...rainbow(i, all.length, now), ch)).join('');
+
+const visible = s => String(s).replace(/\x1b\[[0-9;]*m/g, '');
+// A box `width` columns wide around `lines` (padded, truncated to fit). The
+// border is `border` (a paint function), or a rainbow flowing around the
+// perimeter when border is 'rainbow'.
+export function box(lines, width, border = paint.dim, now = Date.now()) {
+  const inner = Math.max(2, width - 4), horiz = width - 2;
+  const ring = horiz * 2 + lines.length * 2;
+  let n = 0;
+  const b = s => border === 'rainbow' ? [...s].map(ch => paint.rgb(...rainbow(n++, ring, now), ch)).join('') : border(s);
+  const fit = l => { const v = visible(l); return v.length > inner ? v.slice(0, inner - 1) + '…' : l + ' '.repeat(inner - v.length); };
+  const out = [b(`┌${'─'.repeat(horiz)}┐`)];
+  for (const l of lines) out.push(`${b('│')} ${fit(l)} ${b('│')}`);
+  out.push(b(`└${'─'.repeat(horiz)}┘`));
+  return out;
 }
 
 // Unknown value: a skeleton — dim ░ cells with a brightness wave sliding

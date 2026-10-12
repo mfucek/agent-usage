@@ -1,6 +1,6 @@
 {
   "name": "agent-usage",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Live Claude (Max/Pro) quota in the terminal, for every account you log into.",
   "type": "module",
   "bin": { "agent-usage": "bin/agent-usage.mjs" },

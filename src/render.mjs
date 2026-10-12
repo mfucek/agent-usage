@@ -1,13 +1,14 @@
 // The status panel: a `Claude` section (one card per account, the auto-switch
 // line) and a `Codex` section (one card). Identical rows on every card.
 import { opts } from './cli.mjs';
-import { CLAUDE_TOKEN_CACHE_MS, MSG_TTL_MS, orderRank } from './config.mjs';
+import { CLAUDE_TOKEN_CACHE_MS, MSG_TTL_MS, VERSION, orderRank } from './config.mjs';
 import { lastSwitchAt, listAccounts } from './archive.mjs';
-import { fmtAge, fmtDur, label, paint, pct, usageBar } from './format.mjs';
+import { box, fmtAge, fmtDur, gradientText, label, paint, pct, usageBar } from './format.mjs';
 import { accountStatus, bankedCount, normalize, projectRows } from './usage.mjs';
 import { autoEnabled, pickCandidate } from './auto.mjs';
 import { normalizeCodex, normalizeCodexCredits } from './codex.mjs';
 import { CODEX_AUTO_THRESHOLD, codexAutoEnabled } from './codex-auto.mjs';
+import { autoUpdateEnabled } from './update.mjs';
 
 const PLACEHOLDER_ROWS = ['Session', 'Weekly', 'Fable'];
 const STATUS_PAINT = { ok: paint.green, 'near limit': paint.yellow, exhausted: paint.red, unknown: paint.gray };
@@ -36,13 +37,17 @@ export function render(state, now) {
   const L = [];
   const rows = rowList(state);
   if (state.sel > rows.length - 1) state.sel = rows.length - 1;
-  const cursor = i => (!opts.once && i === state.sel ? paint.cyan('>') : ' ');
+  const cursor = i => (!opts.once && !state.bannerSel && i === state.sel ? paint.cyan('>') : ' ');
 
-  const title = 'agent-usage';
+  const title = `agent-usage v${VERSION}`;
   const probed = state.probedAt ? `probed ${fmtDur(now - state.probedAt)} ago` : 'probing…';
   const width = Math.max(40, process.stdout.columns || 80);
-  L.push(paint.bold(title) + ' '.repeat(Math.max(1, width - title.length - probed.length - 1)) + paint.dim(probed));
+  const banner = updateBanner(state, width, now);
+  if (banner.length) L.push(...banner, '');
+  L.push(paint.bold('agent-usage') + paint.dim(` v${VERSION}`) + ' '.repeat(Math.max(1, width - title.length - probed.length - 1)) + paint.dim(probed));
   L.push('');
+  const news = whatsNewCard(state, width, now);
+  if (news.length) L.push(...news, '');
   L.push(paint.bold('Claude'));
   rows.forEach((r, i) => {
     if (r.kind === 'claude') { r.active ? renderActive(L, state, now, cursor(i)) : renderArchived(L, state, now, cursor(i), r); L.push(''); }
@@ -62,6 +67,42 @@ export function render(state, now) {
     L.push(paint.dim('↑↓ select · enter switch/toggle · u use reset · l login · r probe · q quit'));
   }
   return L.join('\n');
+}
+
+// ─── Self-update ─────────────────────────────────────────────────────────────
+export const WHATS_NEW_MS = 2 * 60_000;
+const whatsNewShown = (state, now) => !!state.whatsNew && now - state.whatsNew.at < WHATS_NEW_MS;
+// Rainbow text and borders move: the TUI redraws ~10×/s while this is true.
+export const animating = (state, now) => !!state.update || whatsNewShown(state, now);
+
+// The buttons the update banner offers right now, left to right.
+export const bannerButtons = () => (autoUpdateEnabled() ? ['update'] : ['update', 'auto']);
+
+// "New update available" banner above the title (xfarm's design): focused by
+// pressing ↑ on the first card, ←/→ pick a button, enter runs it.
+function updateBanner(state, width, now) {
+  const u = state.update;
+  if (!u || opts.once) return [];
+  const behind = paint.dim(`${u.behind} commit${u.behind === 1 ? '' : 's'} behind`);
+  if (state.updating) return box([`✦ ${gradientText('UPDATING…', now)}  ${behind}`], width, paint.dim, now);
+  const names = { update: '[ Update ]', auto: '[ Enable Auto-Update ]' };
+  const ctas = bannerButtons().map((b, i) => (state.bannerSel && state.bannerBtn === i ? paint.reverse(paint.bold(names[b])) : paint.bold(names[b]))).join(' ');
+  const why = u.dirty && autoUpdateEnabled() ? paint.dim(' · local changes, auto-update paused') : '';
+  const left = `✦ ${gradientText('NEW UPDATE AVAILABLE', now)}  ${behind}${why}`;
+  const gap = Math.max(1, width - 4 - visibleLen(left) - visibleLen(ctas));
+  return box([`${left}${' '.repeat(gap)}${ctas}`], width, state.bannerSel ? paint.yellow : paint.dim, now);
+}
+
+// After a relaunch: what the update brought in, in a rainbow-bordered card.
+// Gone after WHATS_NEW_MS or the first keypress.
+function whatsNewCard(state, width, now) {
+  if (!whatsNewShown(state, now) || opts.once) return [];
+  const { changes } = state.whatsNew;
+  const MAX = 6;
+  const lines = [`✦ ${gradientText(`UPDATED TO v${VERSION}`, now)}  ${paint.dim(`${changes.length} change${changes.length === 1 ? '' : 's'}`)}`];
+  for (const c of changes.slice(0, MAX)) lines.push(`  ${paint.dim('•')} ${c}`);
+  if (changes.length > MAX) lines.push(paint.dim(`  … and ${changes.length - MAX} more`));
+  return box(lines, width, 'rainbow', now);
 }
 
 // A one-off message (switch done, reset used, error…) in a box whose border

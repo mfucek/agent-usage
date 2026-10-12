@@ -14,9 +14,10 @@ import { countClaudeProcs } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } from './auto.mjs';
-import { activeIndex, cardList, render, rowList } from './render.mjs';
+import { activeIndex, animating, bannerButtons, cardList, render, rowList } from './render.mjs';
 import { createFrameWriter } from './terminal.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
+import { UPDATE_CHECK_MS, UPDATED_FROM_ENV, autoUpdateEnabled, changesSince, checkForUpdate, relaunch, reloadAutoUpdate, runUpdate, setAutoUpdate } from './update.mjs';
 import { bankedCount, claimReset, fetchUsage, markFail, mergeLive, normalize, projectRows, readCache, usableGrant } from './usage.mjs';
 
 const firstLine = e => String(e?.message || e).split('\n')[0];
@@ -108,6 +109,23 @@ async function runCommand() {
     console.log(r.text);
     process.exit(r.ok ? 0 : 1);
   }
+  if (opts.update) {
+    const u = await checkForUpdate();
+    if (!u) { console.log('agent-usage is up to date (or this is not a git checkout with an upstream)'); return true; }
+    console.log(`${u.behind} commit${u.behind === 1 ? '' : 's'} behind — updating…`);
+    const r = await runUpdate();
+    if (!r.ok) throw new Error(r.message);
+    const changes = changesSince(r.from);
+    console.log(`updated:${changes.map(c => `\n  • ${c}`).join('')}`);
+    return true;
+  }
+  if (opts.autoUpdate != null) {
+    const v = opts.autoUpdate.toLowerCase();
+    if (v === 'on' || v === 'off') setAutoUpdate(v === 'on');
+    else if (v) throw new Error(`auto-update takes 'on' or 'off', not '${opts.autoUpdate}'`);
+    console.log(`auto-update: ${autoUpdateEnabled() ? 'on' : 'off'} (live mode checks GitHub every ${UPDATE_CHECK_MS / 60_000} min, pulls, and restarts itself)`);
+    return true;
+  }
   if (opts.autoReset != null) {
     const v = opts.autoReset.toLowerCase();
     if (v === 'on' || v === 'off') setCodexAuto(v === 'on');
@@ -131,6 +149,8 @@ export function createApp({ live = false } = {}) {
     // from the shared cache (written by the statusline, plain endpoint) has
     // none, so the card keeps showing this until our next own fetch.
     resets: null, confirm: null, claiming: false,
+    // Self-update: upstream status, the banner's focus, what the last update brought.
+    update: null, updating: false, bannerSel: false, bannerBtn: 0, whatsNew: null,
     codex: { auth: opts.noCodex ? null : loadCodexAuth(), usage: null, usageAt: null, error: null, lastAt: 0, nextProbeAt: 0, backoffUntil: 0, sessions: 0, credits: null, creditsAt: null },
   };
   logActiveAccount(state.account.email);
@@ -407,7 +427,14 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
   const out = process.stdout;
   const altScreen = !!out.isTTY;
   if (altScreen) out.write(`${ESC}?1049h${ESC}?25l`);
-  process.on('exit', () => { if (altScreen) out.write(`${ESC}?2026l${ESC}?25h${ESC}?1049l`); });
+  let restored = false;
+  const restoreTerminal = () => {
+    if (restored) return;
+    restored = true;
+    if (process.stdin.isTTY) { process.stdin.setRawMode(false); process.stdin.pause(); }
+    if (altScreen) out.write(`${ESC}?2026l${ESC}?25h${ESC}?1049l`);
+  };
+  process.on('exit', restoreTerminal);
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
 
   const writer = createFrameWriter(out);
@@ -508,10 +535,66 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
       .finally(() => { loggingIn = false; draw(); });
   }
 
+  // ─── Self-update ───────────────────────────────────────────────────────────
+  const updatedFrom = process.env[UPDATED_FROM_ENV];
+  if (updatedFrom) state.whatsNew = { changes: changesSince(updatedFrom), at: Date.now() };
+  let checking = false, autoFailedFor = null;
+  function checkUpdate() {
+    if (checking || state.updating) return;
+    checking = true;
+    checkForUpdate().then(u => {
+      state.update = u;
+      if (!u) { state.bannerSel = false; return; }
+      // Auto-update: skip a working copy with local edits, a moment where a
+      // reset claim or login is in flight, and an upstream that already failed.
+      if (reloadAutoUpdate() && !u.dirty && !state.claiming && !loggingIn && autoFailedFor !== u.upstream) doUpdate(true);
+    }).finally(() => { checking = false; draw(); });
+  }
+
+  function doUpdate(auto = false) {
+    if (state.updating) return;
+    state.updating = true; state.bannerSel = false;
+    draw();
+    const upstream = state.update?.upstream;
+    runUpdate().then(r => {
+      if (r.ok) { restoreTerminal(); process.stdout.write('agent-usage: updated — restarting…\n'); relaunch(r.from); }
+      if (auto) autoFailedFor = upstream;
+      state.updating = false;
+      say(`${paint.red(auto ? 'auto-update failed:' : 'update failed:')} ${r.message}`);
+      draw();
+    });
+  }
+
+  // ↑ on the first card focuses the banner; ←/→ pick a button; enter runs it;
+  // ↓ leaves. Any other key leaves the banner and does its usual thing.
+  function bannerKey(k) {
+    if (!state.update || state.updating) return false;
+    const up = k === '\x1b[A' || k === 'k';
+    if (!state.bannerSel) {
+      if (!up || state.sel !== 0) return false;
+      state.bannerSel = true; state.bannerBtn = 0;
+      return true;
+    }
+    const buttons = bannerButtons();
+    if (up) return true;
+    if (k === '\x1b[B' || k === 'j') { state.bannerSel = false; return true; }
+    if (k === '\x1b[D') { state.bannerBtn = Math.max(0, state.bannerBtn - 1); return true; }
+    if (k === '\x1b[C') { state.bannerBtn = Math.min(buttons.length - 1, state.bannerBtn + 1); return true; }
+    if (k === '\r' || k === '\n') {
+      if (buttons[state.bannerBtn] === 'auto') { setAutoUpdate(true); say(`${paint.green('auto-update on')} — new versions install and restart on their own`); }
+      doUpdate();
+      return true;
+    }
+    state.bannerSel = false;
+    return false;
+  }
+
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.setEncoding('utf8');
     process.stdin.on('data', k => {
       if (k !== 'u') state.confirm = null; // anything but the second `u` cancels a pending reset
+      state.whatsNew = null; // the what's-new card goes away on the first keypress
+      if (bannerKey(k)) { draw(); return; }
       if (k === 'q' || k === '\x03') process.exit(0); // q or Ctrl-C
       else if (k === 'r') reprobe();
       else if (k === '\x1b[A' || k === 'k') state.sel = Math.max(0, state.sel - 1);
@@ -536,6 +619,8 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
     });
   }
   pollSessions();
+  // Wall-clock due time on the 1s tick, like the probes: sleep-safe.
+  if (out.isTTY) { let nextUpdateAt = 0; setInterval(() => { if (Date.now() >= nextUpdateAt) { nextUpdateAt = Date.now() + UPDATE_CHECK_MS; checkUpdate(); } }, 1000); }
   if (!opts.noCodex) startCodexPolling(probeCodex, e => { state.codex.error = firstLine(e); });
   tick();
   setInterval(tick, 1000);
@@ -543,7 +628,7 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
   // Once a second for the countdowns; ~10×/s while a skeleton bar is on screen
   // so its wave moves. draw() skips the write when nothing changed.
   let lastDraw = 0;
-  setInterval(() => { const now = Date.now(); if (skeletonShown(now) || now - lastDraw >= 1000) { lastDraw = now; draw(); } }, 100);
+  setInterval(() => { const now = Date.now(); if (skeletonShown(now) || animating(state, now) || now - lastDraw >= 1000) { lastDraw = now; draw(); } }, 100);
   setInterval(pollSessions, PS_POLL_MS);
 }
 

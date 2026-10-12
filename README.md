@@ -55,43 +55,32 @@ Live Claude (Max/Pro) quota in the terminal, for every account you log into. Swi
 - macOS (tokens in the keychain) or Linux (tokens in `~/.claude/.credentials.json`)
 - Optional: the Codex CLI, logged in with ChatGPT, for the Codex card
 
-**Steps**
+**One-liner** (clones to `~/.local/share/agent-usage`, runs `npm ci`, puts an `agent-usage` launcher in `~/.local/bin`):
 
-1. Clone and install dependencies:
+```sh
+curl -fsSL https://raw.githubusercontent.com/mfucek/agent-usage/main/install.sh | bash
+```
 
-   ```sh
-   git clone https://github.com/mfucek/agent-usage.git
-   cd agent-usage
-   npm ci
-   ```
+Then:
 
-2. Put `agent-usage` on your `PATH` (pick one):
+1. Check it works: `agent-usage --once`. You should see one card for the account Claude Code is logged into.
+2. Run the live dashboard: `agent-usage`.
+3. Add more accounts: press `l` in the dashboard (browser login), or run `claude /login` with another account while the dashboard is open. Each account gets its own card and stays there.
 
-   ```sh
-   npm link                      # global symlink to this checkout
-   # or
-   echo "alias agent-usage=\"node $PWD/bin/agent-usage.mjs\"" >> ~/.zshrc && source ~/.zshrc
-   ```
+If the installer warns that `~/.local/bin` is not on your `PATH`, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new terminal.
 
-3. Check it works:
+**Manual install** (any directory you like):
 
-   ```sh
-   agent-usage --once
-   ```
+```sh
+git clone https://github.com/mfucek/agent-usage.git
+cd agent-usage
+npm ci
+npm link        # or: alias agent-usage="node $PWD/bin/agent-usage.mjs"
+```
 
-   You should see one card for the account Claude Code is logged into.
+**Update:** automatic while the dashboard runs (see [Updates](#updates)). By hand: `agent-usage update`, or re-run the installer.
 
-4. Run the live dashboard:
-
-   ```sh
-   agent-usage
-   ```
-
-5. Add more accounts: press `l` in the dashboard (browser login), or run `claude /login` with another account while the dashboard is open. Each account gets its own card and stays there.
-
-**Update:** `git pull && npm ci` in the checkout.
-
-**Uninstall:** `npm unlink -g agent-usage` (or remove the alias), delete the checkout, and optionally `rm -rf ~/.local/state/agent-usage ~/.config/agent-usage` (archived account tokens and settings).
+**Uninstall:** `rm -rf ~/.local/share/agent-usage ~/.local/bin/agent-usage` (or `npm unlink -g agent-usage` and delete your checkout), and optionally `rm -rf ~/.local/state/agent-usage ~/.config/agent-usage` (archived account tokens and settings).
 
 ## Configuration
 
@@ -124,6 +113,8 @@ agent-usage auto [on|off]    # show or set auto-switch (see below)
 agent-usage reset EMAIL      # spend one banked limit reset on that Claude account (no confirmation)
 agent-usage reset codex      # spend one Codex reset credit
 agent-usage auto-reset [on|off] # show or set Codex auto use reset
+agent-usage update           # pull the latest version now (see Updates)
+agent-usage auto-update [on|off] # show or set auto-update (default on)
 ```
 
 `select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
@@ -147,6 +138,30 @@ Select the `auto use reset` line below the Codex card and press `Enter`, or run 
 While live mode runs, a successful Codex probe automatically spends the soonest-expiring usable credit when **the same main usage window is at least 95% used and its reset is at least 24 hours away**. Both boundaries are inclusive. Usage and credits must both have been freshly fetched; missing credits, expired authentication, failed probes, or an active manual reset confirmation prevent an automatic claim. With automation enabled, Codex checks every **30 seconds** on its own timer, independently of Claude backoff, slow Claude probes, and `-i`. The toggle shows the next check countdown. With automation off it polls every 5 minutes; `r` probes immediately. Transient probe failures retry on the next 30-second check; server `Retry-After` delays are respected. Triggering depends on the usage endpoint reporting the threshold, so a sudden usage spike can still reach the limit between checks. Usage and credits refresh again after a claim, and the result appears in the dashboard.
 
 Successful claims block duplicate spending for that high-usage window until a fresh snapshot shows recovery or a different reset date. Failed claims retry after 60 seconds (or a longer server `Retry-After`), using fresh usage and credit reads and only the **same still-usable credit**. An uncertain response keeps the same redemption request ID; a definite no-op gets a new request ID. If the credit disappears or is being redeemed, automation waits instead of spending another credit. This guard also covers manual resets and lasts for the live process. Automation does not run for `status`, `--once`, `json`, explicit `reset` commands, or with `--no-codex`.
+
+## Updates
+
+agent-usage updates itself from GitHub, the same way [xfarm](https://github.com/mfucek/xfarm) does. While the dashboard runs it checks the checkout's upstream every 5 minutes (`git fetch`). When there are new commits, a banner appears above the title:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ✦ NEW UPDATE AVAILABLE  2 commits behind   [ Update ] [ Enable Auto-Update ] │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Press `↑` on the first card to focus it, `←`/`→` to pick a button, `Enter` to run it. Updating pulls fast-forward only, runs `npm ci` when `package.json` or the lockfile changed, and restarts the dashboard in the same terminal. The restarted dashboard shows what came in, in a rainbow-bordered card that goes away on the first keypress:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ✦ UPDATED TO v2.1.0  2 changes                                               │
+│   • Show plan name on each card                                              │
+│   • Faster session polling                                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Auto-update is on by default**: the dashboard pulls and restarts on its own, and the banner only flashes `UPDATING…`. It holds off while a reset claim or browser login is in flight, and never touches a checkout with uncommitted edits to tracked files (the banner then says `local changes, auto-update paused`; `[ Update ]` still tries). A pull that fails (diverged history, conflicts) is not retried until upstream moves again. Turn it off with `agent-usage auto-update off` or `{ "autoUpdate": false }` in the config file; the banner then offers `[ Enable Auto-Update ]`.
+
+Checks are silent when the install is not a git checkout, has no upstream, or is offline. One-shot commands (`status`, `--once`, `json`, …) never check.
 
 ## The rows
 
@@ -229,6 +244,7 @@ src/switch.mjs        switchTo / storeLogin
 src/usage.mjs         usage endpoint, shared cache, normalisation
 src/local.mjs         running claude processes
 src/codex-auto.mjs    Codex auto reset setting, thresholds, repeat-claim guard
+src/update.mjs        self-update: upstream check, ff-only pull + npm ci, relaunch
 src/format.mjs        ANSI paint, bars, number/duration formatting
 src/render.mjs        the cards
 src/terminal.mjs      incremental physical-row repainting, ANSI/Unicode wrapping
@@ -237,4 +253,4 @@ src/app.mjs           one-shot commands, probe loop, TUI
 
 `npm run check` syntax-checks every module and runs one `--once` probe. Honors `CLAUDE_CONFIG_DIR` and `NO_COLOR`.
 
-`npm test` checks incremental painting in a headless terminal and Codex automatic resets (thresholds, persistence, fresh probes, and duplicate-claim protection), using isolated files and mocked APIs. Live output rewrites only changed rows, batches updates with DEC 2026 synchronized-output markers, and clears the full screen only on initialization or resize. Long lines wrap at the terminal width; rows beyond the terminal height are clipped to prevent scrolling. Enlarge the window to see more rows.
+`npm test` checks incremental painting in a headless terminal, Codex automatic resets (thresholds, persistence, fresh probes, and duplicate-claim protection), and self-update against throwaway git repos, using isolated files and mocked APIs. Live output rewrites only changed rows, batches updates with DEC 2026 synchronized-output markers, and clears the full screen only on initialization or resize. Long lines wrap at the terminal width; rows beyond the terminal height are clipped to prevent scrolling. Enlarge the window to see more rows.

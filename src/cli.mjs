@@ -4,8 +4,8 @@ const argv = process.argv.slice(2);
 
 // Subcommand sugar: `agent-usage list`, `agent-usage select <email>`, … map
 // onto the flags below so scripts get a non-TUI interface without the dashes.
-const SUB_FLAG = { list: 'accounts', accounts: 'accounts', login: 'login', status: 'once', json: 'json', whoami: 'whoami', current: 'whoami', help: 'help' };
-const SUB_ARG = { select: 'switchTo', switch: 'switchTo', forget: 'forget', auto: 'auto', 'auto-reset': 'autoReset', reset: 'reset' };
+const SUB_FLAG = { list: 'accounts', accounts: 'accounts', login: 'login', status: 'once', json: 'json', whoami: 'whoami', current: 'whoami', help: 'help', update: 'update' };
+const SUB_ARG = { select: 'switchTo', switch: 'switchTo', forget: 'forget', auto: 'auto', 'auto-reset': 'autoReset', 'auto-update': 'autoUpdate', reset: 'reset' };
 const sub = {};
 if (argv[0] && !argv[0].startsWith('-')) {
   const cmd = argv.shift();
@@ -41,6 +41,10 @@ commands (one-shot, script-friendly):
   auto-reset [on|off] show or set Codex auto use reset: usage >=95% and that
                    window's reset >=1 day away (checks every 30s in live mode;
                    setting changes also apply to an already-running TUI)
+  update           pull the latest version from GitHub now (fast-forward only;
+                   reinstalls dependencies when the lockfile changed)
+  auto-update [on|off] show or set auto-update (default on): live mode checks
+                   GitHub every 5 min, pulls, and restarts itself in place
 
 options:
   -i, --interval N probe interval in seconds (min 30, default 60)
@@ -61,9 +65,11 @@ config (~/.config/agent-usage/config.json):
   { "autoSwitch": true }                auto-switch on (the TUI toggle writes this)
   { "autoThreshold": 90 }               auto-switch trigger/eligibility percent
   { "codexAutoReset": true }            Codex auto use reset on (default off)
+  { "autoUpdate": false }               auto-update off (default on)
 
 live keys: ↑/↓ select · enter switch (or toggle automation) · u use a banked reset on the
-selected card (press twice) · l login in browser · r probe now · q quit`;
+selected card (press twice) · l login in browser · r probe now · q quit
+update banner: ↑ on the first card to focus it · ←/→ pick a button · enter run it`;
 
 export const opts = {
   help: has('-h') || has('--help') || !!sub.help,
@@ -80,4 +86,6 @@ export const opts = {
   auto: sub.auto ?? null,
   autoReset: sub.autoReset ?? null,
   reset: sub.reset ?? null,
+  update: !!sub.update,
+  autoUpdate: sub.autoUpdate ?? null,
 };
