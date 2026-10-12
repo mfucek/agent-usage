@@ -105,6 +105,8 @@ export const REFRESH_AHEAD_MS = 30 * 60_000;
 export const ACTIVE_REFRESH_AHEAD_MS = 5 * 60_000;
 export const REFRESH_RETRY_MS = 10 * 60_000;
 export const PS_POLL_MS = 2000;
+// A subagent transcript untouched this long is treated as dead, not running.
+export const SUBAGENT_STALE_MS = 30 * 60_000;
 export const MSG_TTL_MS = 60_000;
 export const FIVE_H = 5 * 3600 * 1000;
 export const WEEK_MS = 7 * 24 * 3600 * 1000;

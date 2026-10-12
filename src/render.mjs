@@ -177,10 +177,12 @@ function columnRows(L, values, muted) {
   L.push(`${GUTTER}${COLS.map(([, w], i) => padCol(muted ? paint.dim(values[i]) : values[i], w)).join('')}`);
 }
 
+// Running sessions, then `(+N)` for the subagents running inside them.
 function sessionsValue(state, email, now) {
   const n = email === state.account.email ? state.sessions : 0;
   const handover = n && now - lastSwitchAt() < CLAUDE_TOKEN_CACHE_MS ? paint.yellow(` switching ≤${CLAUDE_TOKEN_CACHE_MS / 1000}s`) : '';
-  return `${n}${handover}`;
+  const sub = n && state.subagents ? paint.dim(` (+${state.subagents})`) : '';
+  return `${n}${sub}${handover}`;
 }
 
 function renderActive(L, state, now, cur) {

@@ -172,7 +172,7 @@ Every card shows the same rows, logged in or not: three bars, then three columns
 | **Session / Weekly / Fable** | `GET api.anthropic.com/api/oauth/usage` — the zero-spend endpoint Claude Code itself uses. Fable always gets a row (from the `weekly_scoped` limit); other scoped buckets (Sonnet, Opus) appear when the plan exposes them. The number after the bar is the time to that bucket's reset. Reset moments are applied locally: a 5h window whose reset has passed renders empty (`ended`); weekly buckets render empty and the countdown rolls forward 7 days (`(reset)`). |
 | **Extra** | Extra-usage credits: `off`, or `%` of the monthly limit. |
 | **Resets** | Banked limit resets (see [Banked resets](#banked-resets)): `⟲ N · 29d` = N resets left, the soonest expiring in 29 days. `⟲ –` none; `⟲ ?` until the first probe that carries the block. |
-| **Sessions** | Running `claude` processes on this machine, refreshed every 2s. All of them count against the logged-in account (see [Switching](#switching)). |
+| **Sessions** | Running `claude` processes on this machine, refreshed every 2s. All of them count against the logged-in account (see [Switching](#switching)). `3 (+7)` = 3 sessions with 7 subagents running inside them, read from the sessions' subagent transcripts. |
 
 Header: `●` email · `logged in` · `ok` / `near limit` / `exhausted`, or `○` email · age since last logged in (gray, `18d`) · `live` / `last known` / `needs login`.
 

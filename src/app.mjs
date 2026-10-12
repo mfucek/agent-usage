@@ -10,7 +10,7 @@ import { CODEX_AUTO_INTERVAL_MS, CODEX_AUTO_THRESHOLD, codexAutoEnabled, createC
 import { archiveActive, archiveUsage, forgetAccount, listAccounts, logActiveAccount, readAccount, saveAccount } from './archive.mjs';
 import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
 import { ESC, fmtDur, paint, skeletonShown } from './format.mjs';
-import { countClaudeProcs } from './local.mjs';
+import { countClaudeProcs, countClaudeSubagents } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } from './auto.mjs';
@@ -144,7 +144,7 @@ export function createApp({ live = false } = {}) {
   const state = {
     cred, account: loadAccount(), usage: null, usageAt: null, error: null,
     probing: false, pendingForce: false, backoffMs: 0, backoffUntil: 0, failedAt: 0, liveSince: 0, activeRefresh: null, activeRefreshTriedAt: 0,
-    sessions: 0, others: new Map(), sel: 0, msg: null, msgAt: 0, probedAt: 0,
+    sessions: 0, subagents: 0, others: new Map(), sel: 0, msg: null, msgAt: 0, probedAt: 0,
     // Last banked-reset block seen for the logged-in account. A probe served
     // from the shared cache (written by the statusline, plain endpoint) has
     // none, so the card keeps showing this until our next own fetch.
@@ -166,6 +166,7 @@ export function createApp({ live = false } = {}) {
       if (mt !== claudeJsonMtime) { claudeJsonMtime = mt; state.account = loadAccount(); logActiveAccount(state.account.email); }
     } catch { /* no .claude.json */ }
     state.sessions = countClaudeProcs();
+    state.subagents = countClaudeSubagents();
     state.usage = mergeLive(state.usage, Date.now(), state.liveSince);
     if (!opts.noCodex) state.codex.sessions = countCodexProcs();
   }
