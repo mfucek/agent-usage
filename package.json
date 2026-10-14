@@ -1,11 +1,19 @@
 {
   "name": "agent-usage",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Live Claude (Max/Pro) quota in the terminal, for every account you log into.",
   "type": "module",
-  "bin": { "agent-usage": "bin/agent-usage.mjs" },
-  "files": ["bin", "src", "README.md"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "agent-usage": "bin/agent-usage.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node bin/agent-usage.mjs",
     "test": "node --test",
