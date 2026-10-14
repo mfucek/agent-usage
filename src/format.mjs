@@ -8,6 +8,7 @@ const wrap = code => v => opts.color ? `${ESC}${code}m${v}${RESET}` : String(v);
 export const paint = {
   rgb: (r, g, b, v) => opts.color ? `${ESC}38;2;${r};${g};${b}m${v}${RESET}` : String(v),
   bold: wrap(1), dim: wrap(2), reverse: wrap(7), gray: wrap(90), green: wrap(32), yellow: wrap(33), red: wrap(31), cyan: wrap(36),
+  alert: wrap('1;97;41'), // bold white on red
 };
 
 function gradientColor(i, width) {

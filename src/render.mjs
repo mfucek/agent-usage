@@ -140,7 +140,7 @@ function quotaLine(row, now, muted = false) {
   if (row.ended && row.window === 'session') reset = paint.gray('  ended');
   else if (row.projected) reset = paint.gray(`${reset} (reset)`);
   const p = row.percent == null ? paint.gray('  –') : (muted ? paint.dim(pct(row.percent).padStart(3)) : pct(row.percent).padStart(3));
-  const full = row.percent >= 100 ? `  ${paint.red('exhausted')}` : '';
+  const full = row.percent >= 100 ? `  ${paint.alert(' ‼ ')}` : '';
   return `  ${label(row.label)} ${usageBar(row.percent, 18, muted, now)} ${p}${reset}${full}`;
 }
 
