@@ -95,12 +95,11 @@ export const CACHE_TTL_MS = 120_000;
 export const MIN_BACKOFF_MS = 5 * 60_000;
 export const MAX_BACKOFF_MS = 30 * 60_000;
 
-// Archived (not logged-in) accounts: poll usage once an hour and refresh their
-// access token when it is within REFRESH_AHEAD_MS of expiring. The logged-in
-// token is refreshed with Claude Code's own 5-minute buffer
-// (src/services/oauth/client.ts isOAuthTokenExpired) so we never rotate it earlier
-// than a running session would.
-export const OTHER_INTERVAL_MS = 60 * 60_000;
+// Archived (not logged-in) accounts: refresh their access token when it is
+// within REFRESH_AHEAD_MS of expiring (their usage poll cadence is
+// OTHER_INTERVAL_MS, below the user config). The logged-in token is refreshed
+// with Claude Code's own 5-minute buffer (src/services/oauth/client.ts
+// isOAuthTokenExpired) so we never rotate it earlier than a running session would.
 export const REFRESH_AHEAD_MS = 30 * 60_000;
 export const ACTIVE_REFRESH_AHEAD_MS = 5 * 60_000;
 export const REFRESH_RETRY_MS = 10 * 60_000;
@@ -119,4 +118,8 @@ function loadConfig() {
 }
 export const config = loadConfig();
 const ORDER = Array.isArray(config.order) ? config.order.map(e => String(e).toLowerCase()) : [];
+// { "otherInterval": 60 } — seconds between usage polls of archived (not
+// logged-in) accounts; default one hour. The probe interval (-i) caps it, so
+// every tick can fetch every card. Each account has its own 429 budget.
+export const OTHER_INTERVAL_MS = Math.max(30, Number(config.otherInterval) || 3600) * 1000;
 export const orderRank = email => { const i = ORDER.indexOf((email || '').toLowerCase()); return i < 0 ? ORDER.length : i; };

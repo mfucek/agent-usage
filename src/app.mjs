@@ -276,7 +276,7 @@ export function createApp({ live = false } = {}) {
         rec.oauth = r; exp = Number(r.expiresAt) || 0;
       }
     }
-    const due = force || now - o.lastAt >= OTHER_INTERVAL_MS;
+    const due = force || now - o.lastAt >= Math.min(OTHER_INTERVAL_MS, opts.intervalMs);
     if (rec.oauth?.accessToken && exp > now && !o.authDead && due && now >= o.backoffUntil) {
       o.lastAt = now;
       const r = await fetchUsage(rec.oauth.accessToken);
@@ -355,10 +355,10 @@ export function createApp({ live = false } = {}) {
     const cred = state.cred;
     try { archiveActive(cred, state.account); } catch { /* best effort */ }
     await probeActive(force, email, cred);
-    for (const rec of listAccounts()) {
-      if (sameEmail(rec.email, email)) continue;
-      try { await probeOther(rec, force); } catch (e) { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); }
-    }
+    // Archived accounts in parallel: each has its own token and 429 budget, so
+    // one tick costs one round-trip, not one per card.
+    await Promise.all(listAccounts().filter(rec => !sameEmail(rec.email, email)).map(rec =>
+      probeOther(rec, force).catch(e => { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); })));
     state.probedAt = Date.now();
   }
 

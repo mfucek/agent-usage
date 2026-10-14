@@ -87,10 +87,10 @@ npm link        # or: alias agent-usage="node $PWD/bin/agent-usage.mjs"
 Optional: pin the card order in `~/.config/agent-usage/config.json`.
 
 ```json
-{ "order": ["matija@example.com", "luka@example.com"] }
+{ "order": ["matija@example.com", "luka@example.com"], "otherInterval": 60 }
 ```
 
-Cards keep that order no matter which account is logged in; accounts not listed follow, newest-seen first.
+Cards keep that order no matter which account is logged in; accounts not listed follow, newest-seen first. `otherInterval` is how often (seconds) archived accounts are polled — default 3600, see [Multiple accounts](#multiple-accounts).
 
 ## Usage
 
@@ -197,7 +197,7 @@ When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, one
 ## Multiple accounts
 
 - Every account seen logged in is archived under `~/.local/state/agent-usage/accounts/<email>.json` (mode 600): its `claudeAiOauth` tokens, `oauthAccount` identity and last usage response. Nothing to configure — log into a second account with `claude /login` (or press `l`) while agent-usage runs and a card appears.
-- Archived tokens are kept alive: within 30 min of expiry the access token is refreshed with the archived refresh token (rotated tokens are written back), and usage is polled once an hour. A card only falls back to "last known" when the refresh token itself is dead.
+- Archived tokens are kept alive: within 30 min of expiry the access token is refreshed with the archived refresh token (rotated tokens are written back), and usage is polled once an hour by default — set `"otherInterval": 60` (seconds) in the config file to poll archived cards on every tick alongside the logged-in one (the `-i` interval caps it; each account has its own rate-limit budget). A card only falls back to "last known" when the refresh token itself is dead.
 - The logged-in account's tokens are re-copied into the archive every probe, so a refresh performed by Claude Code (which rotates refresh tokens) is picked up within one interval. agent-usage refreshes the logged-in token itself only while no `claude` process is running, with Claude Code's own 5-minute expiry buffer and under its refresh lock (`~/.claude.lock`); otherwise the sessions do it and the `Token` row says so.
 - Refresh requests send the same scope set Claude Code sends for claude.ai tokens (`user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload`), so a token stored with a narrower set gets widened by the server instead of frozen.
 
