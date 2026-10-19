@@ -2,12 +2,12 @@
 import { statSync, unlinkSync } from 'node:fs';
 import { HELP, opts } from './cli.mjs';
 import {
-  ACTIVE_REFRESH_AHEAD_MS, CACHE_FILE, CACHE_TTL_MS, CLAUDE_JSON, CODEX_INTERVAL_MS, FAIL_FILE, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
+  ACTIVE_REFRESH_AHEAD_MS, CACHE_FILE, CACHE_TTL_MS, CLAUDE_JSON, CODEX_INTERVAL_MS, FAIL_FILE, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
   REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS, RESET_CONFIRM_MS,
 } from './config.mjs';
 import { consumeCodexResetCredit, countCodexProcs, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits } from './codex.mjs';
 import { CODEX_AUTO_INTERVAL_MS, CODEX_AUTO_THRESHOLD, codexAutoEnabled, createCodexResetGuard, reloadCodexAuto, setCodexAuto, startCodexPolling } from './codex-auto.mjs';
-import { archiveActive, archiveUsage, forgetAccount, listAccounts, logActiveAccount, readAccount, saveAccount } from './archive.mjs';
+import { archiveActive, archiveUsage, forgetAccount, listAccounts, loadPollState, logActiveAccount, readAccount, saveAccount, savePollState } from './archive.mjs';
 import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
 import { ESC, fmtDur, paint, skeletonShown } from './format.mjs';
 import { countClaudeProcs, countClaudeSubagents } from './local.mjs';
@@ -23,6 +23,13 @@ import { bankedCount, claimReset, fetchUsage, markFail, mergeLive, normalize, pr
 const firstLine = e => String(e?.message || e).split('\n')[0];
 const sameEmail = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 const backoff = (prev, retryAfterMs) => Math.max(retryAfterMs || 0, Math.min((prev || MIN_BACKOFF_MS / 2) * 2, MAX_BACKOFF_MS));
+// ±20%, so archived-account polls do not land on a fixed rhythm.
+const jittered = ms => Math.round(ms * (0.8 + Math.random() * 0.4));
+
+// Probe state of one archived account. `nextAt` is its next due time (a
+// regular poll or the end of a 429 wait); `strikes` counts 429s in a row.
+const newOther = () => ({ live: false, error: null, authDead: false, lastAt: 0, nextAt: 0, strikes: 0, parked: false, inFlight: false, refreshTriedAt: 0, refreshError: null });
+const unpark = o => { o.strikes = 0; o.parked = false; o.nextAt = 0; o.error = null; };
 
 // A probe that never settles froze polling for good (seen 2026-10-08: probing
 // stuck, no socket, no pending abort timer). Every probe now settles within
@@ -153,6 +160,7 @@ export function createApp({ live = false } = {}) {
     update: null, updating: false, bannerSel: false, bannerBtn: 0, whatsNew: null,
     codex: { auth: opts.noCodex ? null : loadCodexAuth(), usage: null, usageAt: null, error: null, lastAt: 0, nextProbeAt: 0, backoffUntil: 0, sessions: 0, credits: null, creditsAt: null },
   };
+  for (const [email, saved] of Object.entries(loadPollState())) state.others.set(email, { ...newOther(), ...saved });
   logActiveAccount(state.account.email);
   state.sel = activeIndex(cardList(state));
   { const arch = state.account.email ? readAccount(state.account.email) : null; if (arch?.usage) state.resets = normalize(arch.usage).resets; }
@@ -258,10 +266,26 @@ export function createApp({ live = false } = {}) {
     } catch (e) { state.activeRefresh = `refresh: ${firstLine(e)}`; }
   }
 
+  const other = email => { let o = state.others.get(email); if (!o) state.others.set(email, o = newOther()); return o; };
+
+  // 429 on an archived account: wait OTHER_BACKOFF_MS[0], [1], [2], then park.
+  // Only `r` asks a parked account again, and a 429 there keeps it parked.
+  function rateLimited(o, retryAfterMs, now) {
+    if (o.parked) return;
+    const step = OTHER_BACKOFF_MS[o.strikes++];
+    if (step == null) { o.parked = true; o.nextAt = 0; return; }
+    o.nextAt = now + Math.max(retryAfterMs || 0, jittered(step));
+  }
+
   async function probeOther(rec, force) {
+    const o = other(rec.email);
+    if (o.inFlight) return;
+    o.inFlight = true;
+    try { await probeOtherNow(rec, o, force); } finally { o.inFlight = false; }
+  }
+
+  async function probeOtherNow(rec, o, force) {
     const now = Date.now();
-    const o = state.others.get(rec.email) || { live: false, error: null, backoffUntil: 0, backoffMs: 0, authDead: false, lastAt: 0, refreshTriedAt: 0, refreshError: null };
-    state.others.set(rec.email, o);
     let exp = Number(rec.oauth?.expiresAt) || 0;
     const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
     // Keep the archived token alive: refresh when expired / about to expire.
@@ -276,20 +300,37 @@ export function createApp({ live = false } = {}) {
         rec.oauth = r; exp = Number(r.expiresAt) || 0;
       }
     }
-    const due = force || now - o.lastAt >= Math.min(OTHER_INTERVAL_MS, opts.intervalMs);
-    if (rec.oauth?.accessToken && exp > now && !o.authDead && due && now >= o.backoffUntil) {
+    // `r` skips the regular wait, not a 429 wait; a parked account waits for `r` alone.
+    const due = o.parked ? force : now >= o.nextAt || (force && !o.strikes);
+    if (rec.oauth?.accessToken && exp > now && !o.authDead && due) {
       o.lastAt = now;
       const r = await fetchUsage(rec.oauth.accessToken);
+      const at = Date.now();
       if (r.error) {
         o.live = false; o.error = r.error;
         if (r.status === 401 || r.status === 403) o.authDead = true;
-        else if (r.status === 429) { o.backoffMs = backoff(o.backoffMs, r.retryAfterMs); o.backoffUntil = now + o.backoffMs; }
-        else o.backoffUntil = now + MIN_BACKOFF_MS;
+        else if (r.status === 429) rateLimited(o, r.retryAfterMs, at);
+        else o.nextAt = at + jittered(MIN_BACKOFF_MS);
       } else {
-        o.live = true; o.error = null; o.backoffMs = 0; o.backoffUntil = 0;
+        o.live = true; unpark(o); o.nextAt = at + jittered(OTHER_INTERVAL_MS);
         archiveUsage(rec.email, r.data, r.fetchedAt);
       }
+      savePollState(state.others);
     } else if (!(exp > now)) o.live = false;
+  }
+
+  // Live mode checks archived accounts every second against their own
+  // jittered due times, so their requests line up with neither the main tick
+  // nor each other. The main tick still visits every account, so a parked one
+  // keeps its token refreshed.
+  function probeOthersDue() {
+    const now = Date.now();
+    for (const rec of listAccounts()) {
+      if (sameEmail(rec.email, state.account.email)) continue;
+      const o = state.others.get(rec.email);
+      if (o && (o.parked || o.inFlight || now < o.nextAt)) continue;
+      probeOther(rec, false).catch(e => { other(rec.email).error = firstLine(e); });
+    }
   }
 
   // `email` / `cred` are snapshots: pollSessions may swap state.account while
@@ -324,6 +365,9 @@ export function createApp({ live = false } = {}) {
     }
     // A cache fetched after our last failure means the endpoint answers again.
     if (!served || r.fetchedAt > state.failedAt) { state.error = null; state.backoffMs = 0; state.backoffUntil = 0; }
+    // Answering as the logged-in account clears its archived-card 429 park.
+    const parked = email && state.others.get(email);
+    if (parked && (parked.strikes || parked.parked)) { unpark(parked); savePollState(state.others); }
     if (opts.json) { const { _account, ...data } = r.data; console.log(JSON.stringify(data, null, 2)); process.exit(0); }
     state.usage = mergeLive(normalize(r.data), Date.now(), state.liveSince);
     state.usageAt = r.fetchedAt;
@@ -358,7 +402,7 @@ export function createApp({ live = false } = {}) {
     // Archived accounts in parallel: each has its own token and 429 budget, so
     // one tick costs one round-trip, not one per card.
     await Promise.all(listAccounts().filter(rec => !sameEmail(rec.email, email)).map(rec =>
-      probeOther(rec, force).catch(e => { state.others.set(rec.email, { ...(state.others.get(rec.email) || {}), error: firstLine(e) }); })));
+      probeOther(rec, force).catch(e => { other(rec.email).error = firstLine(e); })));
     state.probedAt = Date.now();
   }
 
@@ -408,7 +452,7 @@ export function createApp({ live = false } = {}) {
     const r = await claimReset(t.token, t.org, t.grant.id);
     for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } } // stale numbers: everyone re-fetches
     if (t.active) { state.usage = null; state.usageAt = null; state.backoffMs = 0; state.backoffUntil = 0; state.liveSince = Date.now(); }
-    else { const o = state.others.get(t.email); if (o) { o.lastAt = 0; o.backoffUntil = 0; o.backoffMs = 0; } }
+    else { const o = state.others.get(t.email); if (o) { unpark(o); savePollState(state.others); } }
     if (r.error) return { ok: false, text: `${paint.red('reset failed:')} ${t.name} · ${r.error}` };
     const left = r.resetsLeft != null ? `${r.resetsLeft} left` : `${Math.max(0, t.banked - 1)} left`;
     switch (r.result) {
@@ -420,11 +464,11 @@ export function createApp({ live = false } = {}) {
     }
   }
 
-  return { state, probe, probeCodex, pollSessions, resetTargetFor, useReset };
+  return { state, probe, probeCodex, probeOthersDue, pollSessions, resetTargetFor, useReset };
 }
 
 // ─── Live TUI ────────────────────────────────────────────────────────────────
-function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useReset }) {
+function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, resetTargetFor, useReset }) {
   const out = process.stdout;
   const altScreen = !!out.isTTY;
   if (altScreen) out.write(`${ESC}?1049h${ESC}?25l`);
@@ -527,7 +571,7 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
         const activate = !c || c.active || email === state.account.email || email === c.email;
         say(paint.green(storeLogin(r, { activate })));
         const o = state.others.get(email);
-        if (o) state.others.set(email, { ...o, authDead: false, error: null, refreshError: null, backoffUntil: 0, backoffMs: 0, lastAt: 0 });
+        if (o) { Object.assign(o, { authDead: false, refreshError: null }); unpark(o); savePollState(state.others); }
         resetActive();
         pollSessions();
         return probe(true).then(() => { state.sel = activeIndex(cardList(state)); });
@@ -625,6 +669,7 @@ function runLive({ state, probe, probeCodex, pollSessions, resetTargetFor, useRe
   if (!opts.noCodex) startCodexPolling(probeCodex, e => { state.codex.error = firstLine(e); });
   tick();
   setInterval(tick, 1000);
+  setInterval(probeOthersDue, 1000);
   draw();
   // Once a second for the countdowns; ~10×/s while a skeleton bar is on screen
   // so its wave moves. draw() skips the write when nothing changed.

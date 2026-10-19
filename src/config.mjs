@@ -78,6 +78,7 @@ export const ACCOUNTS_DIR = join(STATE_DIR, 'accounts');
 // carry no account id, so local usage is attributed to the account that was
 // logged in at each request's timestamp.
 export const SWITCH_LOG = join(STATE_DIR, 'switch-log.jsonl');
+export const POLL_STATE_FILE = join(STATE_DIR, 'poll-state.json');
 export const CONFIG_FILE = join(process.env.XDG_CONFIG_HOME || join(HOME, '.config'), 'agent-usage', 'config.json');
 
 // Shared with ~/.claude/statusline-command.sh: whoever fetched last writes here,
@@ -94,6 +95,11 @@ export const LIVE_MAX_AGE_MS = 5 * 3600_000;
 export const CACHE_TTL_MS = 120_000;
 export const MIN_BACKOFF_MS = 5 * 60_000;
 export const MAX_BACKOFF_MS = 30 * 60_000;
+// Archived accounts on 429: wait each step in turn, then park. A parked
+// account is only asked again by `r` (or once it becomes the logged-in one),
+// and a 429 on that retry keeps it parked. Persisted in POLL_STATE_FILE so a
+// restart does not re-ask every account at once.
+export const OTHER_BACKOFF_MS = [5 * 60_000, 10 * 60_000, 30 * 60_000];
 
 // Archived (not logged-in) accounts: refresh their access token when it is
 // within REFRESH_AHEAD_MS of expiring (their usage poll cadence is
@@ -119,7 +125,7 @@ function loadConfig() {
 export const config = loadConfig();
 const ORDER = Array.isArray(config.order) ? config.order.map(e => String(e).toLowerCase()) : [];
 // { "otherInterval": 60 } — seconds between usage polls of archived (not
-// logged-in) accounts; default one hour. The probe interval (-i) caps it, so
-// every tick can fetch every card. Each account has its own 429 budget.
+// logged-in) accounts; default one hour. Independent of -i, and jittered per
+// poll so the accounts do not ask in lockstep. Each account has its own 429 budget.
 export const OTHER_INTERVAL_MS = Math.max(30, Number(config.otherInterval) || 3600) * 1000;
 export const orderRank = email => { const i = ORDER.indexOf((email || '').toLowerCase()); return i < 0 ? ORDER.length : i; };

@@ -1,7 +1,7 @@
 // Per-account archive (tokens + identity + last usage) and the switch log.
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ACCOUNTS_DIR, STATE_DIR, SWITCH_LOG, orderRank } from './config.mjs';
+import { ACCOUNTS_DIR, POLL_STATE_FILE, STATE_DIR, SWITCH_LOG, orderRank } from './config.mjs';
 
 export function safeReaddir(d) { try { return readdirSync(d); } catch { return []; } }
 
@@ -47,6 +47,23 @@ export function archiveActive(oauth, account) {
 export function archiveUsage(email, data, at) {
   const rec = readAccount(email); if (!rec) return;
   rec.usage = data; rec.usageAt = at; rec.savedAt = Date.now(); saveAccount(rec);
+}
+
+// ─── Archived-account poll state ─────────────────────────────────────────────
+// { [email]: { strikes, parked, nextAt, error } } — the 429 backoff/park and the
+// next due time, so a restart keeps waiting instead of asking every account.
+export function loadPollState() {
+  try { return JSON.parse(readFileSync(POLL_STATE_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+export function savePollState(others) {
+  const out = {};
+  for (const [email, o] of others) out[email] = { strikes: o.strikes, parked: o.parked, nextAt: o.nextAt, error: o.error };
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    const tmp = `${POLL_STATE_FILE}.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(out));
+    renameSync(tmp, POLL_STATE_FILE);
+  } catch { /* best effort */ }
 }
 
 // ─── Switch log ──────────────────────────────────────────────────────────────

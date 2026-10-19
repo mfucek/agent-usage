@@ -197,7 +197,7 @@ When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, one
 ## Multiple accounts
 
 - Every account seen logged in is archived under `~/.local/state/agent-usage/accounts/<email>.json` (mode 600): its `claudeAiOauth` tokens, `oauthAccount` identity and last usage response. Nothing to configure — log into a second account with `claude /login` (or press `l`) while agent-usage runs and a card appears.
-- Archived tokens are kept alive: within 30 min of expiry the access token is refreshed with the archived refresh token (rotated tokens are written back), and usage is polled once an hour by default — set `"otherInterval": 60` (seconds) in the config file to poll archived cards on every tick alongside the logged-in one (the `-i` interval caps it; each account has its own rate-limit budget). A card only falls back to "last known" when the refresh token itself is dead.
+- Archived tokens are kept alive: within 30 min of expiry the access token is refreshed with the archived refresh token (rotated tokens are written back), and usage is polled once an hour by default — set `"otherInterval": 60` (seconds) in the config file to poll archived cards about once a minute. Each poll is jittered ±20% and runs on its own schedule, independent of `-i` and of the other accounts (each account has its own rate-limit budget). A card only falls back to "last known" when the refresh token itself is dead.
 - The logged-in account's tokens are re-copied into the archive every probe, so a refresh performed by Claude Code (which rotates refresh tokens) is picked up within one interval. agent-usage refreshes the logged-in token itself only while no `claude` process is running, with Claude Code's own 5-minute expiry buffer and under its refresh lock (`~/.claude.lock`); otherwise the sessions do it and the `Token` row says so.
 - Refresh requests send the same scope set Claude Code sends for claude.ai tokens (`user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload`), so a token stored with a narrower set gets widened by the server instead of frozen.
 
@@ -229,6 +229,8 @@ Not mirrored, on purpose: Claude Code's `/login` wipes the whole keychain blob (
 ## Rate limits and the shared cache
 
 The usage endpoint is aggressively rate limited (HTTP 429, `retry-after: 0`, small sliding window per account). agent-usage and `~/.claude/statusline-command.sh` share one cache at `/tmp/.claude-usage-cache` (120s TTL): whoever fetched last writes, everyone else reads. Writes are tagged with `_account` and a cache belonging to another account is ignored; a switch deletes it. On 429 the last good response is shown with `(cached Xm ago)` and the next network probe backs off 5 → 30 min (`r` forces one). `/tmp/.claude-usage-cache.fail` tells the statusline to skip fetching for 5 min after any failure.
+
+Archived cards back off on their own: a 429 waits 5 → 10 → 30 min (a longer `retry-after` wins), and a fourth 429 in a row pauses the card — no more automatic polls. Only `r` asks a paused card again; a 429 there keeps it paused, a 200 resumes normal polling. Logging in to it, spending a reset on it, or a good response while it is the logged-in account also clears the pause. The state lives in `~/.local/state/agent-usage/poll-state.json`, so a restart keeps waiting.
 
 ## Layout
 

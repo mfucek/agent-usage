@@ -235,5 +235,8 @@ function renderArchived(L, state, now, cur, c) {
   const nu = rec.usage ? normalize(rec.usage) : null;
   quotaRows(L, nu, now, true);
   columnRows(L, [extraValue(nu?.extra), resetsValue(nu?.resets, now), sessionsValue(state, c.email, now)], true);
-  if (o.error && !o.authDead) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
+  if (o.authDead) return;
+  if (o.parked) L.push(`  ${paint.dim('rate limited — paused, r retries')}`);
+  else if (o.strikes && o.nextAt > now) L.push(`  ${paint.dim(`rate limited — retrying in ${fmtDur(o.nextAt - now)}`)}`);
+  else if (o.error) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
 }
