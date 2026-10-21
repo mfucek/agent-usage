@@ -1,7 +1,8 @@
 // Auto-switch: when the logged-in session (or its weekly) hits the threshold,
 // move to the eligible account whose session window resets soonest. Eligible =
-// session, weekly and Fable all under the threshold, refresh token alive. An idle account (no
-// active window) counts as a full 5h from reset — a fresh window starts on use.
+// session, weekly and Fable all under the threshold, refresh token alive, not
+// disabled by the user. An idle account (no active window) counts as a full 5h
+// from reset — a fresh window starts on use.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { CONFIG_FILE, FIVE_H, config } from './config.mjs';
@@ -10,16 +11,31 @@ import { normalize, projectRows } from './usage.mjs';
 
 export const AUTO_THRESHOLD = Math.min(100, Number(config.autoThreshold) || 90);
 
+function writeConfig(patch) {
+  let cfg = {};
+  try { cfg = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) || {}; } catch { /* fresh config */ }
+  Object.assign(cfg, patch);
+  mkdirSync(dirname(CONFIG_FILE), { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+}
+
 let enabled = !!config.autoSwitch;
 export const autoEnabled = () => enabled;
 export function setAuto(on) {
   enabled = !!on;
-  let cfg = {};
-  try { cfg = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) || {}; } catch { /* fresh config */ }
-  cfg.autoSwitch = enabled;
-  mkdirSync(dirname(CONFIG_FILE), { recursive: true });
-  writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+  writeConfig({ autoSwitch: enabled });
   return enabled;
+}
+
+// { "disabled": ["x@y.com"] } — accounts opted out of auto-switching (`d` on a
+// card). They are still probed and can still be switched to by hand.
+const disabled = new Set(Array.isArray(config.disabled) ? config.disabled.map(e => String(e).toLowerCase()) : []);
+export const isDisabled = email => disabled.has(String(email || '').toLowerCase());
+export function toggleDisabled(email) {
+  const e = String(email || '').toLowerCase();
+  if (!disabled.delete(e)) disabled.add(e);
+  writeConfig({ disabled: [...disabled] });
+  return disabled.has(e);
 }
 
 // {sess, week, fable, tts} from a normalized usage snapshot, aged to `now`.
@@ -40,6 +56,7 @@ export function pickCandidate(activeEmail, others = new Map(), now = Date.now())
   const cands = [];
   for (const rec of listAccounts()) {
     if (rec.email.toLowerCase() === (activeEmail || '').toLowerCase()) continue;
+    if (isDisabled(rec.email)) continue;
     const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
     if (rexp && rexp < now) continue;
     if (others.get(rec.email)?.authDead) continue;

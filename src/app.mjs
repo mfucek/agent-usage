@@ -13,7 +13,7 @@ import { ESC, fmtDur, paint, skeletonShown } from './format.mjs';
 import { countClaudeProcs, countClaudeSubagents } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
-import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, usageSummary } from './auto.mjs';
+import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, toggleDisabled, usageSummary } from './auto.mjs';
 import { activeIndex, animating, bannerButtons, cardList, render, rowList } from './render.mjs';
 import { createFrameWriter } from './terminal.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
@@ -517,6 +517,14 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
     switchToEmail(row.email, 'switched to');
   }
 
+  // `d` on a Claude card opts that account out of (or back into) auto-switching.
+  function doToggleDisabled() {
+    const row = rowList(state)[state.sel];
+    if (row?.kind !== 'claude') { say(paint.dim('d works on a Claude account card')); return; }
+    const off = toggleDisabled(row.email);
+    say(off ? `${paint.dim('disabled')} ${row.email} — auto-switch skips it` : `${paint.green('enabled')} ${paint.cyan(row.email)} — auto-switch may pick it again`);
+  }
+
   // `u` twice within RESET_CONFIRM_MS spends one banked reset on the selected
   // card. Any other key in between cancels. Server-side it is Claude Code's
   // /limit-reset claim, or Codex's credit consume.
@@ -648,6 +656,7 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
       else if (k === '\r' || k === '\n') doSwitch();
       else if (k === 'l') doLogin();
       else if (k === 'u') doUseReset();
+      else if (k === 'd') doToggleDisabled();
       draw();
     });
   }

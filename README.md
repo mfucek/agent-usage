@@ -119,7 +119,7 @@ agent-usage auto-update [on|off] # show or set auto-update (default on)
 
 `select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
 
-Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle automation) · `u` use a banked reset on the selected card (press twice) · `l` browser login · `r` probe now · `q` quit.
+Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle automation) · `u` use a banked reset on the selected card (press twice) · `d` disable/enable the selected Claude account for auto-switch · `l` browser login · `r` probe now · `q` quit.
 
 ## Auto-switch
 
@@ -129,7 +129,9 @@ The line after the Claude cards is a toggle (also `agent-usage auto on|off`, per
 > [x] auto-switch → matija
 ```
 
-While the TUI is running, each probe checks the logged-in account; at ≥90% session or weekly usage it switches to the account with session <90%, weekly <90%, Fable <90%, a live refresh token, and the **nearest session reset** (an idle account counts as a full 5h away). The name after the arrow is always who that would be (`none eligible` when nobody qualifies); `agent-usage auto` prints the same with the numbers. The threshold is `"autoThreshold"` in the config. Nothing switches when the TUI isn't running.
+While the TUI is running, each probe checks the logged-in account; at ≥90% session or weekly usage it switches to the account with session <90%, weekly <90%, Fable <90%, a live refresh token, not disabled, and the **nearest session reset** (an idle account counts as a full 5h away). The name after the arrow is always who that would be (`none eligible` when nobody qualifies); `agent-usage auto` prints the same with the numbers. The threshold is `"autoThreshold"` in the config. Nothing switches when the TUI isn't running.
+
+`d` on a Claude card disables that account: auto-switch never picks it, and its card turns gray with `disabled` where `live` / `last known` would be. It is still probed and `Enter` still switches to it by hand. `d` again re-enables it. Persisted as `"disabled": ["email", …]` in the config file.
 
 ## Codex auto use reset
 

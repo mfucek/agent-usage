@@ -5,7 +5,7 @@ import { CLAUDE_TOKEN_CACHE_MS, MSG_TTL_MS, VERSION, orderRank } from './config.
 import { lastSwitchAt, listAccounts } from './archive.mjs';
 import { box, fmtAge, fmtDur, gradientText, label, paint, pct, usageBar } from './format.mjs';
 import { accountStatus, bankedCount, normalize, projectRows } from './usage.mjs';
-import { autoEnabled, pickCandidate } from './auto.mjs';
+import { autoEnabled, isDisabled, pickCandidate } from './auto.mjs';
 import { normalizeCodex, normalizeCodexCredits } from './codex.mjs';
 import { CODEX_AUTO_THRESHOLD, codexAutoEnabled } from './codex-auto.mjs';
 import { autoUpdateEnabled } from './update.mjs';
@@ -64,7 +64,7 @@ export function render(state, now) {
   if (!opts.once) {
     L.push('');
     if (state.msg && now - state.msgAt < MSG_TTL_MS) { L.push(...messageBox(state.msg, width)); L.push(''); }
-    L.push(paint.dim('↑↓ select · enter switch/toggle · u use reset · l login · r probe · q quit'));
+    L.push(paint.dim('↑↓ select · enter switch/toggle · u use reset · d disable · l login · r probe · q quit'));
   }
   return L.join('\n');
 }
@@ -192,7 +192,8 @@ function renderActive(L, state, now, cur) {
   let status;
   if (u) { const s = accountStatus(projectRows(u.rows, now)); status = STATUS_PAINT[s](s); }
   else status = limited ? paint.yellow('rate limited') : state.error ? paint.red('error') : paint.gray('probing…');
-  L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))} ${paint.dim('· logged in ·')} ${status}`);
+  const off = isDisabled(acct.email) ? paint.gray(' · disabled') : '';
+  L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(acct.email || 'unknown'))} ${paint.dim('· logged in ·')} ${status}${off}`);
 
   const tokExp = state.cred.expiresAt ? Date.parse(state.cred.expiresAt) || Number(state.cred.expiresAt) : null;
   if (state.activeRefresh) L.push(`  ${label('Token')} ${paint.yellow(state.activeRefresh)}`);
@@ -220,13 +221,24 @@ function renderCodex(L, state, now, cur) {
   if (cx.error) L.push(`  ${paint.red('probe error:')} ${cx.error}`);
 }
 
+// A disabled card is drawn as usual, then flattened to plain gray (the
+// cursor keeps its colour).
+const strip = s => String(s).replace(/\x1b\[[0-9;]*m/g, '');
 function renderArchived(L, state, now, cur, c) {
+  if (!isDisabled(c.email)) return renderCard(L, state, now, cur, c, false);
+  const lines = [];
+  renderCard(lines, state, now, ' ', c, true);
+  lines.forEach((l, i) => L.push(i ? paint.gray(strip(l)) : `${cur} ${paint.gray(strip(l).slice(2))}`));
+}
+
+function renderCard(L, state, now, cur, c, disabled) {
   const rec = c.rec;
   const o = state.others.get(c.email) || {};
   const exp = Number(rec.oauth?.expiresAt) || 0;
   const rexp = Number(rec.oauth?.refreshTokenExpiresAt) || 0;
   let src;
-  if (o.authDead || (rexp && rexp < now)) src = paint.red('needs login');
+  if (disabled) src = 'disabled';
+  else if (o.authDead || (rexp && rexp < now)) src = paint.red('needs login');
   else if (o.live) src = paint.green('live');
   else src = paint.gray(exp > now ? 'last known' : 'last known · token expired');
   const seen = rec.seenAt ? paint.gray(fmtAge(now - rec.seenAt)) : paint.gray('?');
