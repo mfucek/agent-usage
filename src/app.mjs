@@ -99,10 +99,10 @@ async function runCommand() {
     const v = opts.auto.toLowerCase();
     if (v === 'on' || v === 'off') setAuto(v === 'on');
     else if (v) throw new Error(`auto takes 'on' or 'off', not '${opts.auto}'`);
-    console.log(`auto-switch: ${autoEnabled() ? 'on' : 'off'} (at ${AUTO_THRESHOLD}% session usage, while the TUI runs)`);
+    console.log(`auto-switch: ${autoEnabled() ? 'on' : 'off'} (at ${AUTO_THRESHOLD}% session or weekly usage, while the TUI runs)`);
     const c = pickCandidate(loadAccount().email);
     console.log(c
-      ? `next: ${c.email} (session ${Math.round(c.sess)}%, fable ${Math.round(c.fable)}%, resets ${fmtDur(c.tts)})`
+      ? `next: ${c.email} (session ${Math.round(c.sess)}%, weekly ${Math.round(c.week)}%, fable ${Math.round(c.fable)}%, resets ${fmtDur(c.tts)})`
       : 'next: no eligible account');
     return true;
   }
@@ -503,7 +503,7 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
     const row = rowList(state)[state.sel];
     if (row?.kind === 'auto') {
       const on = setAuto(!autoEnabled());
-      say(on ? `${paint.green('auto-switch on')} — switches at ${AUTO_THRESHOLD}% session usage while this TUI runs` : paint.dim('auto-switch off'));
+      say(on ? `${paint.green('auto-switch on')} — switches at ${AUTO_THRESHOLD}% session or weekly usage while this TUI runs` : paint.dim('auto-switch off'));
       return;
     }
     if (row?.kind === 'codex-auto') {
@@ -543,15 +543,16 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
       .finally(() => { state.claiming = false; draw(); });
   }
 
-  // After each probe: if enabled and the active session is at the threshold,
-  // move to the best candidate. The new account starts under the threshold,
-  // so this fires once per exhausted session, not every probe.
+  // After each probe: if enabled and the active session or weekly is at the
+  // threshold, move to the best candidate. The new account starts under the
+  // threshold, so this fires once per exhausted window, not every probe.
   function maybeAutoSwitch() {
     if (!autoEnabled()) return;
     const a = usageSummary(state.usage);
-    if (!a || a.sess < AUTO_THRESHOLD) return;
+    if (!a || (a.sess < AUTO_THRESHOLD && a.week < AUTO_THRESHOLD)) return;
     const c = pickCandidate(state.account.email, state.others);
-    if (!c) { say(paint.yellow(`session ${Math.round(a.sess)}% — auto-switch found no eligible account`)); return; }
+    const which = a.sess >= AUTO_THRESHOLD ? `session ${Math.round(a.sess)}%` : `weekly ${Math.round(a.week)}%`;
+    if (!c) { say(paint.yellow(`${which} — auto-switch found no eligible account`)); return; }
     switchToEmail(c.email, 'auto-switched to');
   }
 
