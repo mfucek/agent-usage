@@ -5,11 +5,12 @@ import {
   ACTIVE_REFRESH_AHEAD_MS, CACHE_FILE, CACHE_TTL_MS, CLAUDE_JSON, CODEX_INTERVAL_MS, CODEX_REFRESH_AHEAD_MS, FAIL_FILE, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
   MSG_TTL_MS, REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS, RESET_CONFIRM_MS,
 } from './config.mjs';
-import { codexAuthFromFile, codexKey, codexPlanLabel, consumeCodexResetCredit, countCodexProcs, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits, readCodexAuthFile } from './codex.mjs';
+import { codexAuthFromFile, codexKey, codexPlanLabel, consumeCodexResetCredit, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits, readCodexAuthFile } from './codex.mjs';
 import {
   archiveCodexActive, archiveCodexSnapshot, codexLogin, codexName, forgetCodexAccount, listCodexAccounts, readCodexAccount, refreshCodexAccount,
   resolveCodexAccount, storeCodexLogin, switchCodexTo,
 } from './codex-accounts.mjs';
+import { countCodexThreads, usageWindows } from './codex-sessions.mjs';
 import { CODEX_AUTO_INTERVAL_MS, CODEX_AUTO_THRESHOLD, codexAutoEnabled, createCodexResetGuard, reloadCodexAuto, setCodexAuto, startCodexPolling } from './codex-auto.mjs';
 import { archiveActive, archiveUsage, forgetAccount, listAccounts, loadPollState, logActiveAccount, readAccount, saveAccount, savePollState } from './archive.mjs';
 import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
@@ -37,6 +38,13 @@ const unpark = o => { o.strikes = 0; o.parked = false; o.nextAt = 0; o.error = n
 // Probe state of one archived Codex account. `unauthorized` (a 401) asks for a
 // token refresh before the next poll.
 const newCodexOther = () => ({ live: false, error: null, authDead: false, unauthorized: false, nextAt: 0, inFlight: false, refreshTriedAt: 0 });
+// After a Codex switch: running threads stay on the account their app-server
+// started with (Codex pins it per process), until that app restarts.
+function staleThreadsNote(fromKey, threads) {
+  const c = fromKey && threads?.get(fromKey);
+  const n = c ? c.sessions + c.subagents : 0;
+  return n ? ` — ${n} running codex thread${n === 1 ? '' : 's'} stay on the old account until their app (T3 Code, Codex app) restarts its codex` : '';
+}
 // `codex:EMAIL` (or `codex:` + account id) names a Codex account on the CLI.
 const codexArg = s => { const m = /^codex(?::(.*))?$/i.exec(s || ''); return m ? (m[1] ?? '') : null; };
 
@@ -114,7 +122,7 @@ async function runCommand() {
     if (cq != null) {
       const rec = resolveCodexAccount(cq);
       const r = switchCodexTo(rec.key);
-      console.log(r.already ? `${codexName(rec)} is already the logged-in codex account` : `switched codex to ${codexName(rec)}${r.running ? ` — ${r.running} running codex session(s) may keep the old account until restarted` : ''}`);
+      console.log(r.already ? `${codexName(rec)} is already the logged-in codex account` : `switched codex to ${codexName(rec)}${staleThreadsNote(r.from, countCodexThreads(Date.now(), usageWindows(listCodexAccounts())))}`);
       return true;
     }
     const email = resolveEmail(opts.switchTo);
@@ -200,7 +208,7 @@ export function createApp({ live = false } = {}) {
     resets: null, confirm: null, claiming: false,
     // Self-update: upstream status, the banner's focus, what the last update brought.
     update: null, updating: false, bannerSel: false, bannerBtn: 0, whatsNew: null,
-    codex: { auth: opts.noCodex ? null : loadCodexAuth(), usage: null, usageAt: null, error: null, lastAt: 0, nextProbeAt: 0, backoffUntil: 0, sessions: 0, credits: null, creditsAt: null },
+    codex: { auth: opts.noCodex ? null : loadCodexAuth(), usage: null, usageAt: null, error: null, lastAt: 0, nextProbeAt: 0, backoffUntil: 0, threads: new Map(), credits: null, creditsAt: null },
     codexOthers: new Map(), // archived Codex accounts' probe state, by key
   };
   // The logged-in Codex account is the first archived one.
@@ -221,7 +229,10 @@ export function createApp({ live = false } = {}) {
     state.sessions = countClaudeProcs();
     state.subagents = countClaudeSubagents();
     state.usage = mergeLive(state.usage, Date.now(), state.liveSince);
-    if (!opts.noCodex) state.codex.sessions = countCodexProcs();
+    if (!opts.noCodex) {
+      const windows = usageWindows([...listCodexAccounts(), { key: codexKey(state.codex.auth), usage: state.codex.usage }]);
+      state.codex.threads = countCodexThreads(Date.now(), windows);
+    }
   }
 
   // A single-flight gate shared by manual probes and the independent timer.
@@ -650,7 +661,7 @@ function runLive({ state, probe, probeCodex, probeCodexOthers, probeOthersDue, p
     if (state.codexOthers.get(row.key)?.inFlight) { say(paint.dim(`${row.name}: probe in flight — press enter again in a moment`)); return; }
     try {
       const r = switchCodexTo(row.key);
-      say(`${paint.green('codex switched to')} ${paint.cyan(row.name)}${r.running ? paint.yellow(` — ${r.running} running codex session(s) may keep the old account until restarted`) : ''}`);
+      say(`${paint.green('codex switched to')} ${paint.cyan(row.name)}${paint.yellow(staleThreadsNote(r.from, state.codex.threads))}`);
       const cx = state.codex;
       Object.assign(cx, { usage: null, usageAt: null, credits: null, creditsAt: null, lastAt: 0, backoffUntil: 0, error: null });
       Promise.all([probeCodex(true), probeCodexOthers(true)]).catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(draw);

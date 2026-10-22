@@ -223,6 +223,14 @@ function renderActive(L, state, now, cur) {
   else if (state.error) L.push(`  ${paint.red('probe error:')} ${state.error}`);
 }
 
+// Running Codex threads created by this account, then `(+N)` spawned subagents.
+// An archived card can have some: they run in an app-server started before a switch.
+function codexThreadsValue(state, key) {
+  const c = state.codex?.threads?.get(key);
+  if (!c) return '0';
+  return `${c.sessions}${c.subagents ? paint.dim(` (+${c.subagents})`) : ''}`;
+}
+
 // The logged-in Codex (ChatGPT) account; `u` spends one of its banked reset
 // credits, the auto use reset line acts on it.
 function renderCodex(L, state, now, cur, c) {
@@ -236,7 +244,7 @@ function renderCodex(L, state, now, cur, c) {
   if (cx.auth.expiresAt && cx.auth.expiresAt <= now) L.push(`  ${label('Token')} ${paint.yellow('expired — codex refreshes it on its next run')}`);
   if (nu) for (const row of projectRows(nu.rows, now)) L.push(quotaLine(row, now, false));
   else L.push(quotaLine({ label: 'Weekly', percent: null }, now, false));
-  columnRows(L, [paint.gray('–'), resetsValue(cx.credits ? normalizeCodexCredits(cx.credits, now) : null, now), String(cx.sessions)], false);
+  columnRows(L, [paint.gray('–'), resetsValue(cx.credits ? normalizeCodexCredits(cx.credits, now) : null, now), codexThreadsValue(state, c.key)], false);
   if (cx.error) L.push(`  ${paint.red('probe error:')} ${cx.error}`);
 }
 
@@ -255,7 +263,7 @@ function renderCodexArchived(L, state, now, cur, c) {
   const nu = rec.usage ? normalizeCodex(rec.usage) : null;
   if (nu?.rows.length) for (const row of projectRows(nu.rows, now)) L.push(quotaLine(row, now, true));
   else L.push(quotaLine({ label: 'Weekly', percent: null }, now, true));
-  columnRows(L, [paint.gray('–'), resetsValue(rec.credits ? normalizeCodexCredits(rec.credits, now) : null, now), '0'], true);
+  columnRows(L, [paint.gray('–'), resetsValue(rec.credits ? normalizeCodexCredits(rec.credits, now) : null, now), codexThreadsValue(state, c.key)], true);
   if (o.error && !o.live) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
 }
 

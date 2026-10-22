@@ -1,7 +1,6 @@
 // Codex (ChatGPT) usage and banked resets. The Codex CLI refreshes the
 // logged-in token itself; we read auth.json to poll usage or spend a reset.
 // Archived accounts and switching live in codex-accounts.mjs.
-import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { CODEX_AUTH_FILE, CODEX_RESET_CONSUME_URL, CODEX_RESET_CREDITS_URL, CODEX_USAGE_URL } from './config.mjs';
@@ -136,19 +135,4 @@ export function normalizeCodex(data) {
   // additional_rate_limits (separately-metered models like Spark) are
   // deliberately not shown — unused rows, they'd only add noise to the card.
   return { rows };
-}
-
-// Interactive codex processes; the shared daemon and server modes don't count.
-const CODEX_WORD = /(^|\/)codex$/;
-const CODEX_DAEMON = new Set(['app-server', 'mcp-server', 'exec-server', 'remote-control']);
-export function countCodexProcs() {
-  try {
-    const out = execFileSync('ps', ['-Ao', 'args='], { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-    let n = 0;
-    for (const line of out.split('\n')) {
-      const [a0 = '', a1 = ''] = line.trim().split(/\s+/);
-      if (CODEX_WORD.test(a0) && !CODEX_DAEMON.has(a1)) n++;
-    }
-    return n;
-  } catch { return 0; }
 }

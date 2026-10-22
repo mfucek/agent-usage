@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CODEX_ACCOUNTS_DIR, CODEX_AUTH_FILE, CODEX_CLIENT_ID, CODEX_HOME, CODEX_TOKEN_URL, orderRank } from './config.mjs';
 import { safeReaddir } from './archive.mjs';
-import { codexAuthFromFile, codexKey, codexPlanLabel, countCodexProcs, readCodexAuthFile } from './codex.mjs';
+import { codexAuthFromFile, codexKey, codexPlanLabel, readCodexAuthFile } from './codex.mjs';
 import { withLockAsync } from './lock.mjs';
 
 // One file per account: { key, email, accountId, plan, authFile, usage,
@@ -70,16 +70,16 @@ function writeCodexAuthFile(raw) {
   renameSync(tmp, CODEX_AUTH_FILE);
 }
 
-// Make an archived account the logged-in one. Returns { already, running }.
+// Make an archived account the logged-in one. Returns { already, from }:
+// `from` is the key that was logged in before.
 export function switchCodexTo(key) {
   const rec = readCodexAccount(key);
   if (!rec?.authFile) throw new Error(`no archived codex tokens for ${key} — log in with l`);
   const cur = archiveCodexActive(undefined, { force: true }); // whoever is logged in now keeps their latest tokens
-  const running = countCodexProcs();
-  if (cur?.key === rec.key) return { already: true, running };
+  if (cur?.key === rec.key) return { already: true, from: cur.key };
   writeCodexAuthFile(rec.authFile);
   rec.seenAt = Date.now(); saveCodexAccount(rec);
-  return { already: false, running };
+  return { already: false, from: cur?.key || null };
 }
 
 // Refresh an archived account's tokens (refresh tokens rotate). Under a
