@@ -60,10 +60,18 @@ export const CLAUDE_TOKEN_CACHE_MS = 30_000;
 
 // ─── Codex's files ───────────────────────────────────────────────────────────
 // The Codex CLI keeps its ChatGPT OAuth tokens in `auth.json` and refreshes
-// them itself on use; we only ever read the file. The usage endpoint is the
-// same one `codex` polls for its own rate-limit display.
+// them itself on use. We write it only to switch accounts (an archived copy
+// goes back in). The usage endpoint is the same one `codex` polls for its own
+// rate-limit display.
 export const CODEX_HOME = process.env.CODEX_HOME || join(HOME, '.codex');
 export const CODEX_AUTH_FILE = join(CODEX_HOME, 'auth.json');
+// Archived (not logged-in) Codex accounts keep their tokens alive with the
+// Codex CLI's own refresh call (codex-rs auth: same client, same scope).
+// Access tokens live ~10 days; the CLI refreshes after 8, we refresh an
+// archived one in its last 2.
+export const CODEX_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+export const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+export const CODEX_REFRESH_AHEAD_MS = 2 * 24 * 3600_000;
 export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/codex/usage';
 // Banked "rate limit reset credits" (what `codex` shows under /limits): list +
 // consume. Consuming is the only write we ever send on the Codex side.
@@ -74,6 +82,7 @@ export const CODEX_INTERVAL_MS = 5 * 60_000;
 // ─── Our state ───────────────────────────────────────────────────────────────
 export const STATE_DIR = join(HOME, '.local', 'state', 'agent-usage');
 export const ACCOUNTS_DIR = join(STATE_DIR, 'accounts');
+export const CODEX_ACCOUNTS_DIR = join(STATE_DIR, 'codex-accounts');
 // Append-only history of which account was logged in from when. Transcripts
 // carry no account id, so local usage is attributed to the account that was
 // logged in at each request's timestamp.

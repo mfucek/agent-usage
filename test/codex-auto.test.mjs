@@ -17,6 +17,7 @@ const { CODEX_AUTH_FILE, CONFIG_FILE, CODEX_USAGE_URL, CODEX_RESET_CREDITS_URL, 
 const { codexAutoEnabled, setCodexAuto, codexResetWindows, createCodexResetGuard, CODEX_AUTO_INTERVAL_MS, CODEX_AUTO_RETRY_MS, startCodexPolling } = await import('../src/codex-auto.mjs');
 const { createApp } = await import('../src/app.mjs');
 const { rowList, render } = await import('../src/render.mjs');
+const { forgetCodexAccount } = await import('../src/codex-accounts.mjs');
 const cli = new URL('../bin/agent-usage.mjs', import.meta.url).pathname;
 const day = 86_400_000;
 const now = Math.floor(Date.now() / 1000) * 1000;
@@ -178,7 +179,10 @@ test('Codex toggle is selectable and reflects the persisted setting', t => {
   assert.match(render(app.state, now), /\[x\] auto use reset/);
   setCodexAuto(false);
   assert.match(render(app.state, now), /\[ \] auto use reset/);
+  // Logged out of codex: the archived card (and the toggle) stay until forgotten.
   app.state.codex.auth = null;
+  assert.ok(rowList(app.state).some(row => row.kind === 'codex' && !row.active));
+  forgetCodexAccount(auth.accountId);
   assert.ok(!rowList(app.state).some(row => row.kind === 'codex-auto'));
 });
 

@@ -1,5 +1,6 @@
-// Codex (ChatGPT) usage and banked resets. auth.json is never written — the
-// Codex CLI refreshes its own token; we read it to poll usage or spend a reset.
+// Codex (ChatGPT) usage and banked resets. The Codex CLI refreshes the
+// logged-in token itself; we read auth.json to poll usage or spend a reset.
+// Archived accounts and switching live in codex-accounts.mjs.
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -12,8 +13,17 @@ const jwtClaims = tok => { try { return JSON.parse(Buffer.from(String(tok).split
 const PLAN = { prolite: 'pro lite', plus: 'plus', pro: 'pro', free: 'free', team: 'team', business: 'business', enterprise: 'enterprise', edu: 'edu' };
 export const codexPlanLabel = p => (p ? PLAN[p] || p : '');
 
-export function loadCodexAuth() {
-  let j; try { j = JSON.parse(readFileSync(CODEX_AUTH_FILE, 'utf8')); } catch { return null; }
+// The raw auth.json object, or null.
+export function readCodexAuthFile() {
+  try { return JSON.parse(readFileSync(CODEX_AUTH_FILE, 'utf8')); } catch { return null; }
+}
+export const loadCodexAuth = () => codexAuthFromFile(readCodexAuthFile());
+
+// One ChatGPT account (a workspace) per key: the same email can sign into a
+// personal and a team workspace, each with its own quota.
+export const codexKey = auth => auth?.accountId || auth?.email || null;
+
+export function codexAuthFromFile(j) {
   const t = j?.tokens;
   if (!t?.access_token) return null; // API-key-only auth has no usage endpoint
   const claims = jwtClaims(t.access_token);

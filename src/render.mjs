@@ -1,12 +1,14 @@
 // The status panel: a `Claude` section (one card per account, the auto-switch
-// line) and a `Codex` section (one card). Identical rows on every card.
+// line) and a `Codex` section (one card per account, the auto reset line).
+// Identical rows on every card.
 import { opts } from './cli.mjs';
 import { CLAUDE_TOKEN_CACHE_MS, MSG_TTL_MS, VERSION, orderRank } from './config.mjs';
 import { lastSwitchAt, listAccounts } from './archive.mjs';
 import { box, fmtAge, fmtDur, gradientText, label, paint, pct, usageBar } from './format.mjs';
 import { accountStatus, bankedCount, normalize, projectRows } from './usage.mjs';
 import { autoEnabled, isDisabled, pickCandidate } from './auto.mjs';
-import { normalizeCodex, normalizeCodexCredits } from './codex.mjs';
+import { codexAuthFromFile, codexKey, normalizeCodex, normalizeCodexCredits } from './codex.mjs';
+import { codexName, listCodexAccounts } from './codex-accounts.mjs';
 import { CODEX_AUTO_THRESHOLD, codexAutoEnabled } from './codex-auto.mjs';
 import { autoUpdateEnabled } from './update.mjs';
 
@@ -23,13 +25,26 @@ export function cardList(state) {
 }
 export const activeIndex = cards => Math.max(0, cards.findIndex(c => c.active));
 
+// Codex cards: the logged-in account (auth.json) and the archived ones, in
+// the same order rules as the Claude cards.
+export function codexCardList(state) {
+  if (opts.noCodex) return [];
+  const activeKey = codexKey(state.codex?.auth);
+  const all = listCodexAccounts();
+  const card = (rec, active) => ({ kind: 'codex', key: rec.key, email: rec.email, active, rec, name: codexName(rec, all) });
+  const cards = all.filter(r => r.key !== activeKey).map(r => card(r, false));
+  if (activeKey) cards.unshift(card(all.find(r => r.key === activeKey) || { key: activeKey, email: state.codex.auth.email, plan: state.codex.auth.plan }, true));
+  return cards.sort((a, b) => orderRank(a.email) - orderRank(b.email) || (a.active ? -1 : b.active ? 1 : 0));
+}
+
 // Everything the cursor can land on, top to bottom: the Claude cards, the
-// auto-switch line, and the Codex card and reset toggle (when present).
+// auto-switch line, and the Codex cards and reset toggle (when present).
 // `state.sel` indexes this.
 export function rowList(state) {
   const rows = cardList(state).map(c => ({ kind: 'claude', ...c }));
   rows.push({ kind: 'auto' });
-  if (state.codex?.auth) rows.push({ kind: 'codex' }, { kind: 'codex-auto' });
+  const codex = codexCardList(state);
+  if (codex.length) rows.push(...codex, { kind: 'codex-auto' });
   return rows;
 }
 
@@ -52,7 +67,11 @@ export function render(state, now) {
   rows.forEach((r, i) => {
     if (r.kind === 'claude') { r.active ? renderActive(L, state, now, cursor(i)) : renderArchived(L, state, now, cursor(i), r); L.push(''); }
     else if (r.kind === 'auto') renderAutoSwitch(L, state, now, cursor(i));
-    else if (r.kind === 'codex') { L.push(''); L.push(paint.bold('Codex')); renderCodex(L, state, now, cursor(i)); }
+    else if (r.kind === 'codex') {
+      L.push('');
+      if (rows[i - 1]?.kind !== 'codex') L.push(paint.bold('Codex'));
+      r.active ? renderCodex(L, state, now, cursor(i), r) : renderCodexArchived(L, state, now, cursor(i), r);
+    }
     else if (r.kind === 'codex-auto') {
       const on = codexAutoEnabled();
       L.push('');
@@ -204,21 +223,40 @@ function renderActive(L, state, now, cur) {
   else if (state.error) L.push(`  ${paint.red('probe error:')} ${state.error}`);
 }
 
-// The Codex (ChatGPT) card: one account, no switching; selectable so `u` can
-// spend one of its banked reset credits.
-function renderCodex(L, state, now, cur) {
+// The logged-in Codex (ChatGPT) account; `u` spends one of its banked reset
+// credits, the auto use reset line acts on it.
+function renderCodex(L, state, now, cur, c) {
   const cx = state.codex;
-  const email = cx.usage?.email || cx.auth.email || 'codex';
+  const email = c.name || cx.usage?.email || cx.auth.email || 'codex';
   const nu = cx.usage ? normalizeCodex(cx.usage) : null;
   let status;
   if (nu) { const s = accountStatus(projectRows(nu.rows, now)); status = STATUS_PAINT[s](s); }
   else status = cx.error ? paint.red('error') : paint.gray('probing…');
-  L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(email))} ${paint.dim('·')} ${status}`);
+  L.push(`${cur} ${paint.green('●')} ${paint.bold(paint.cyan(email))} ${paint.dim('· logged in ·')} ${status}`);
   if (cx.auth.expiresAt && cx.auth.expiresAt <= now) L.push(`  ${label('Token')} ${paint.yellow('expired — codex refreshes it on its next run')}`);
   if (nu) for (const row of projectRows(nu.rows, now)) L.push(quotaLine(row, now, false));
   else L.push(quotaLine({ label: 'Weekly', percent: null }, now, false));
   columnRows(L, [paint.gray('–'), resetsValue(cx.credits ? normalizeCodexCredits(cx.credits, now) : null, now), String(cx.sessions)], false);
   if (cx.error) L.push(`  ${paint.red('probe error:')} ${cx.error}`);
+}
+
+// An archived Codex account: last known numbers, kept fresh by its own
+// polls; Enter writes it into auth.json.
+function renderCodexArchived(L, state, now, cur, c) {
+  const rec = c.rec;
+  const o = state.codexOthers?.get(c.key) || {};
+  const exp = codexAuthFromFile(rec.authFile)?.expiresAt || 0;
+  let src;
+  if (o.authDead) src = paint.red('needs login');
+  else if (o.live) src = paint.green('live');
+  else src = paint.gray(exp > now ? 'last known' : 'last known · token expired');
+  const seen = rec.seenAt ? paint.gray(fmtAge(now - rec.seenAt)) : paint.gray('?');
+  L.push(`${cur} ${paint.gray('○')} ${paint.dim(c.name)} ${paint.dim('·')} ${seen} ${paint.dim('·')} ${src}`);
+  const nu = rec.usage ? normalizeCodex(rec.usage) : null;
+  if (nu?.rows.length) for (const row of projectRows(nu.rows, now)) L.push(quotaLine(row, now, true));
+  else L.push(quotaLine({ label: 'Weekly', percent: null }, now, true));
+  columnRows(L, [paint.gray('–'), resetsValue(rec.credits ? normalizeCodexCredits(rec.credits, now) : null, now), '0'], true);
+  if (o.error && !o.live) L.push(`  ${paint.dim(`probe: ${o.error}`)}`);
 }
 
 // A disabled card is drawn as usual, then flattened to plain gray (the

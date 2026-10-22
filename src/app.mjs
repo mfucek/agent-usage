@@ -2,10 +2,14 @@
 import { statSync, unlinkSync } from 'node:fs';
 import { HELP, opts } from './cli.mjs';
 import {
-  ACTIVE_REFRESH_AHEAD_MS, CACHE_FILE, CACHE_TTL_MS, CLAUDE_JSON, CODEX_INTERVAL_MS, FAIL_FILE, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
-  REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS, RESET_CONFIRM_MS,
+  ACTIVE_REFRESH_AHEAD_MS, CACHE_FILE, CACHE_TTL_MS, CLAUDE_JSON, CODEX_INTERVAL_MS, CODEX_REFRESH_AHEAD_MS, FAIL_FILE, MAX_BACKOFF_MS, MIN_BACKOFF_MS, OTHER_BACKOFF_MS, OTHER_INTERVAL_MS, PS_POLL_MS,
+  MSG_TTL_MS, REFRESH_AHEAD_MS, REFRESH_LOCK, REFRESH_RETRY_MS, RESET_CONFIRM_MS,
 } from './config.mjs';
-import { consumeCodexResetCredit, countCodexProcs, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits } from './codex.mjs';
+import { codexAuthFromFile, codexKey, codexPlanLabel, consumeCodexResetCredit, countCodexProcs, fetchCodexResetCredits, fetchCodexUsage, loadCodexAuth, normalizeCodexCredits, readCodexAuthFile } from './codex.mjs';
+import {
+  archiveCodexActive, archiveCodexSnapshot, codexLogin, codexName, forgetCodexAccount, listCodexAccounts, readCodexAccount, refreshCodexAccount,
+  resolveCodexAccount, storeCodexLogin, switchCodexTo,
+} from './codex-accounts.mjs';
 import { CODEX_AUTO_INTERVAL_MS, CODEX_AUTO_THRESHOLD, codexAutoEnabled, createCodexResetGuard, reloadCodexAuto, setCodexAuto, startCodexPolling } from './codex-auto.mjs';
 import { archiveActive, archiveUsage, forgetAccount, listAccounts, loadPollState, logActiveAccount, readAccount, saveAccount, savePollState } from './archive.mjs';
 import { ENV_TOKEN_OVERRIDE, loadAccount, loadCredentialBlob, loadCredentials, planLabel, writeCredentials } from './credentials.mjs';
@@ -14,7 +18,7 @@ import { countClaudeProcs, countClaudeSubagents } from './local.mjs';
 import { withLockAsync } from './lock.mjs';
 import { browserLogin, refreshOauth } from './oauth.mjs';
 import { AUTO_THRESHOLD, autoEnabled, pickCandidate, setAuto, toggleDisabled, usageSummary } from './auto.mjs';
-import { activeIndex, animating, bannerButtons, cardList, render, rowList } from './render.mjs';
+import { activeIndex, animating, bannerButtons, cardList, codexCardList, render, rowList } from './render.mjs';
 import { createFrameWriter } from './terminal.mjs';
 import { HANDOVER_NOTE, storeLogin, switchTo } from './switch.mjs';
 import { UPDATE_CHECK_MS, UPDATED_FROM_ENV, autoUpdateEnabled, changesSince, checkForUpdate, relaunch, reloadAutoUpdate, runUpdate, setAutoUpdate } from './update.mjs';
@@ -30,6 +34,11 @@ const jittered = ms => Math.round(ms * (0.8 + Math.random() * 0.4));
 // regular poll or the end of a 429 wait); `strikes` counts 429s in a row.
 const newOther = () => ({ live: false, error: null, authDead: false, lastAt: 0, nextAt: 0, strikes: 0, parked: false, inFlight: false, refreshTriedAt: 0, refreshError: null });
 const unpark = o => { o.strikes = 0; o.parked = false; o.nextAt = 0; o.error = null; };
+// Probe state of one archived Codex account. `unauthorized` (a 401) asks for a
+// token refresh before the next poll.
+const newCodexOther = () => ({ live: false, error: null, authDead: false, unauthorized: false, nextAt: 0, inFlight: false, refreshTriedAt: 0 });
+// `codex:EMAIL` (or `codex:` + account id) names a Codex account on the CLI.
+const codexArg = s => { const m = /^codex(?::(.*))?$/i.exec(s || ''); return m ? (m[1] ?? '') : null; };
 
 // A probe that never settles froze polling for good (seen 2026-10-08: probing
 // stuck, no socket, no pending abort timer). Every probe now settles within
@@ -75,22 +84,51 @@ async function runCommand() {
       const exp = Number(r.oauth?.expiresAt) || 0, rexp = Number(r.oauth?.refreshTokenExpiresAt) || 0;
       console.log(`${r.email === cur ? '*' : ' '} ${r.email.padEnd(28)} ${planLabel(r.oauth).padEnd(10)} seen ${fmtDur(now - (r.seenAt || 0)).padEnd(6)} ago  token ${exp > now ? `valid ${fmtDur(exp - now)}` : 'expired'}  refresh ${rexp ? (rexp > now ? `valid ${fmtDur(rexp - now)}` : 'EXPIRED') : '?'}${sessionSummary(r, now)}`);
     }
+    if (!opts.noCodex) {
+      try { archiveCodexActive(); } catch { /* best effort */ }
+      const cx = listCodexAccounts();
+      const curKey = codexKey(loadCodexAuth());
+      if (cx.length) console.log('codex:');
+      for (const r of cx) {
+        const exp = codexAuthFromFile(r.authFile)?.expiresAt || 0;
+        console.log(`${r.key === curKey ? '*' : ' '} ${r.email.padEnd(28)} ${codexPlanLabel(r.plan).padEnd(10)} ${(r.seenAt ? `seen ${fmtDur(now - r.seenAt).padEnd(6)} ago` : 'never logged in').padEnd(17)}  token ${exp > now ? `valid ${fmtDur(exp - now)}` : 'expired'}  id ${r.key}`);
+      }
+    }
     return true;
   }
   if (opts.forget != null) {
     if (!opts.forget) throw new Error('forget needs an email');
+    const cq = codexArg(opts.forget);
+    if (cq != null) {
+      const rec = resolveCodexAccount(cq);
+      console.log(forgetCodexAccount(rec.key) ? `forgot codex ${codexName(rec)}${rec.key === codexKey(loadCodexAuth()) ? ' (still logged in to codex; it is archived again on the next probe)' : ''}` : `codex ${rec.email}: nothing archived`);
+      return true;
+    }
     const email = resolveEmail(opts.forget);
     console.log(forgetAccount(email) ? `forgot ${email}` : `${email}: nothing archived`);
     return true;
   }
   if (opts.switchTo != null) {
     if (!opts.switchTo) throw new Error('select needs an email');
+    const cq = codexArg(opts.switchTo);
+    if (cq != null) {
+      const rec = resolveCodexAccount(cq);
+      const r = switchCodexTo(rec.key);
+      console.log(r.already ? `${codexName(rec)} is already the logged-in codex account` : `switched codex to ${codexName(rec)}${r.running ? ` — ${r.running} running codex session(s) may keep the old account until restarted` : ''}`);
+      return true;
+    }
     const email = resolveEmail(opts.switchTo);
     const r = switchTo(email);
     console.log(r.already ? `${email} is already the logged-in account` : `switched Claude Code to ${email}${r.running ? ` — ${r.running} running claude session(s) ${HANDOVER_NOTE}` : ''}`);
     return true;
   }
   if (opts.login) {
+    if (/^codex$/i.test(opts.loginProvider)) {
+      const raw = await codexLogin({ onStatus: (m, url) => console.error(url ? `${m}\n${url}` : m) });
+      console.log(storeCodexLogin(raw).text);
+      return true;
+    }
+    if (opts.loginProvider && !/^claude$/i.test(opts.loginProvider)) throw new Error(`login takes 'claude' or 'codex', not '${opts.loginProvider}'`);
     const r = await browserLogin({ onStatus: m => console.error(m) });
     console.log(storeLogin(r, { activate: true }));
     return true;
@@ -110,7 +148,11 @@ async function runCommand() {
     if (!opts.reset) throw new Error('reset needs a target: an account email (or unique substring) or `codex`');
     const app = createApp();
     await app.probe(true); // fresh numbers, fresh grant list (the plain shared cache carries no grants)
-    const t = /^codex$/i.test(opts.reset) ? app.resetTargetFor({ kind: 'codex' }) : app.resetTargetFor({ kind: 'claude', email: resolveEmail(opts.reset) });
+    const cq = codexArg(opts.reset);
+    let row = { kind: 'claude', email: cq == null ? resolveEmail(opts.reset) : null };
+    if (cq === '') row = { kind: 'codex' };
+    else if (cq != null) { const rec = resolveCodexAccount(cq); row = { kind: 'codex', key: rec.key, active: rec.key === codexKey(app.state.codex.auth) }; }
+    const t = app.resetTargetFor(row);
     if (t.error) throw new Error(t.error);
     const r = await app.useReset(t);
     console.log(r.text);
@@ -159,7 +201,10 @@ export function createApp({ live = false } = {}) {
     // Self-update: upstream status, the banner's focus, what the last update brought.
     update: null, updating: false, bannerSel: false, bannerBtn: 0, whatsNew: null,
     codex: { auth: opts.noCodex ? null : loadCodexAuth(), usage: null, usageAt: null, error: null, lastAt: 0, nextProbeAt: 0, backoffUntil: 0, sessions: 0, credits: null, creditsAt: null },
+    codexOthers: new Map(), // archived Codex accounts' probe state, by key
   };
+  // The logged-in Codex account is the first archived one.
+  if (!opts.noCodex) { try { archiveCodexActive(); } catch { /* best effort */ } }
   for (const [email, saved] of Object.entries(loadPollState())) state.others.set(email, { ...newOther(), ...saved });
   logActiveAccount(state.account.email);
   state.sel = activeIndex(cardList(state));
@@ -188,7 +233,8 @@ export function createApp({ live = false } = {}) {
   }
 
   // Poll faster while automation is enabled; claims require fresh probes.
-  // Re-read auth.json each time — the Codex CLI rotates the token in place.
+  // Re-read auth.json each time — the Codex CLI rotates the token in place,
+  // and a switch or `codex login` may have put another account there.
   async function doProbeCodex(force) {
     if (opts.noCodex) return;
     const cx = state.codex;
@@ -196,8 +242,10 @@ export function createApp({ live = false } = {}) {
     const auto = live && reloadCodexAuto();
     if (auto && !wasEnabled) cx.lastAt = 0;
     const interval = auto ? CODEX_AUTO_INTERVAL_MS : CODEX_INTERVAL_MS;
-    const auth = loadCodexAuth();
-    if ((auth?.accountId || auth?.email) !== (cx.auth?.accountId || cx.auth?.email)) {
+    const raw = readCodexAuthFile();
+    const auth = codexAuthFromFile(raw);
+    if (auth) { try { archiveCodexActive(raw); } catch { /* best effort */ } }
+    if (codexKey(auth) !== codexKey(cx.auth)) {
       cx.usage = null; cx.usageAt = null; cx.credits = null; cx.creditsAt = null;
       cx.lastAt = 0; cx.backoffUntil = 0; cx.error = null;
     }
@@ -224,6 +272,8 @@ export function createApp({ live = false } = {}) {
       cx.backoffUntil = Math.max(cx.backoffUntil, now + Math.max(c.retryAfterMs || 0, auto ? CODEX_AUTO_INTERVAL_MS : MIN_BACKOFF_MS));
     }
     cx.nextProbeAt = Math.max(cx.nextProbeAt, cx.backoffUntil);
+    const snap = { ...(r.error ? {} : { usage: r.data, usageAt: r.fetchedAt }), ...(c.error ? {} : { credits: c.data, creditsAt: c.fetchedAt }) };
+    if (Object.keys(snap).length) { try { archiveCodexSnapshot(codexKey(cx.auth), snap); } catch { /* best effort */ } }
     // Both reads must succeed in this probe; cached/error snapshots cannot
     // authorize spending a credit. One-shot commands never auto-spend.
     if (r.error || c.error) return;
@@ -239,6 +289,60 @@ export function createApp({ live = false } = {}) {
       // Refresh immediately; claiming remains set to suppress nested claims.
       await doProbeCodex(true);
     } finally { state.claiming = false; }
+  }
+
+  // ─── Archived Codex accounts ─────────────────────────────────────────────
+  // Same idea as the archived Claude cards: each polls usage + credits on its
+  // own jittered schedule and keeps its token alive (refreshCodexAccount).
+  const cxOther = key => { let o = state.codexOthers.get(key); if (!o) state.codexOthers.set(key, o = newCodexOther()); return o; };
+
+  async function probeCodexOther(rec, force) {
+    const o = cxOther(rec.key);
+    if (o.inFlight) return;
+    o.inFlight = true;
+    try { await probeCodexOtherNow(rec, o, force); } finally { o.inFlight = false; }
+  }
+
+  async function probeCodexOtherNow(rec, o, force) {
+    const now = Date.now();
+    let auth = codexAuthFromFile(rec.authFile);
+    if (!auth) { o.authDead = true; o.live = false; return; }
+    if (!o.authDead && (o.unauthorized || auth.expiresAt - now < CODEX_REFRESH_AHEAD_MS) && (force || now - o.refreshTriedAt > REFRESH_RETRY_MS)) {
+      o.refreshTriedAt = now;
+      const r = await refreshCodexAccount(rec.key);
+      if (r.skipped) return; // it became the logged-in account meanwhile
+      if (r.error) { o.error = r.error; if (r.dead) o.authDead = true; }
+      else { rec = r.rec; auth = codexAuthFromFile(rec.authFile); o.unauthorized = false; o.error = null; o.nextAt = 0; }
+    }
+    if (o.authDead || !(auth.expiresAt > now)) { o.live = false; return; }
+    if (!force && now < o.nextAt) return;
+    const u = await fetchCodexUsage(auth);
+    const at = Date.now();
+    if (u.error) {
+      o.live = false; o.error = u.error;
+      if (u.status === 401) o.unauthorized = true;
+      o.nextAt = at + Math.max(u.retryAfterMs || 0, jittered(MIN_BACKOFF_MS));
+      return;
+    }
+    const c = await fetchCodexResetCredits(auth);
+    o.live = true; o.error = c.error ? `resets: ${c.error}` : null;
+    o.nextAt = at + jittered(CODEX_INTERVAL_MS);
+    archiveCodexSnapshot(rec.key, { usage: u.data, usageAt: u.fetchedAt, ...(c.error ? {} : { credits: c.data, creditsAt: c.fetchedAt }) });
+  }
+
+  // Archived Codex accounts that are due (all of them when forced).
+  function probeCodexOthers(force) {
+    if (opts.noCodex) return Promise.resolve();
+    const now = Date.now();
+    const activeKey = codexKey(state.codex.auth);
+    const jobs = [];
+    for (const rec of listCodexAccounts()) {
+      if (rec.key === activeKey) continue;
+      const o = state.codexOthers.get(rec.key);
+      if (!force && o && (o.inFlight || o.authDead || now < o.nextAt)) continue;
+      jobs.push(probeCodexOther(rec, force).catch(e => { cxOther(rec.key).error = firstLine(e); }));
+    }
+    return Promise.all(jobs);
   }
 
   // Refresh the logged-in account's token ourselves only when no `claude`
@@ -331,6 +435,7 @@ export function createApp({ live = false } = {}) {
       if (o && (o.parked || o.inFlight || now < o.nextAt)) continue;
       probeOther(rec, false).catch(e => { other(rec.email).error = firstLine(e); });
     }
+    probeCodexOthers(false);
   }
 
   // `email` / `cred` are snapshots: pollSessions may swap state.account while
@@ -382,7 +487,10 @@ export function createApp({ live = false } = {}) {
     if (state.probing) { if (force) state.pendingForce = true; return; }
     const gen = state.probing = ++probeGen;
     // Start Codex before awaiting any Claude network work.
-    const codexTask = probeCodex(force).catch(e => { state.codex.error = firstLine(e); });
+    const codexTask = Promise.all([
+      probeCodex(force).catch(e => { state.codex.error = firstLine(e); }),
+      within(probeCodexOthers(force), PROBE_DEADLINE_MS, 'codex accounts probe').catch(() => {}),
+    ]);
     try { await within(probeClaude(force), PROBE_DEADLINE_MS, 'claude probe'); }
     finally { if (state.probing === gen) state.probing = 0; await codexTask; } // codexTask has its own deadline
     if (state.pendingForce) { state.pendingForce = false; return probe(true); }
@@ -411,13 +519,24 @@ export function createApp({ live = false } = {}) {
   // Returns { error } when there is nothing usable.
   function resetTargetFor(row) {
     const now = Date.now();
+    if (row.kind === 'codex' && row.key && !row.active) {
+      const rec = readCodexAccount(row.key);
+      const auth = codexAuthFromFile(rec?.authFile);
+      const name = `codex ${rec ? codexName(rec) : row.key}`;
+      if (!auth) return { error: `${name}: no archived tokens — log in with l` };
+      if (!(auth.expiresAt > now)) return { error: `${name}: token expired — wait for its refresh or log in with l` };
+      const resets = normalizeCodexCredits(rec.credits, now);
+      const g = usableGrant(resets, now);
+      if (!g) return rec.credits ? { error: `${name}: no banked reset credits` } : { error: `${name}: reset credits not loaded yet`, notLoaded: true };
+      return { kind: 'codex', name, key: row.key, active: false, auth, usage: rec.usage, grant: g, banked: bankedCount(resets, now) };
+    }
     if (row.kind === 'codex') {
       const cx = state.codex;
       if (!cx.auth) return { error: 'codex: not logged in (no ~/.codex/auth.json tokens)' };
       const resets = normalizeCodexCredits(cx.credits, now);
       const g = usableGrant(resets, now);
       if (!g) return cx.credits ? { error: 'codex: no banked reset credits' } : { error: 'codex: reset credits not loaded yet', notLoaded: true };
-      return { kind: 'codex', name: 'codex', auth: cx.auth, grant: g, banked: bankedCount(resets, now) };
+      return { kind: 'codex', name: 'codex', key: codexKey(cx.auth), active: true, auth: cx.auth, usage: cx.usage, grant: g, banked: bankedCount(resets, now) };
     }
     if (row.kind !== 'claude') return { error: 'select an account card or the codex card first' };
     const email = row.email;
@@ -441,13 +560,17 @@ export function createApp({ live = false } = {}) {
   // Spend the target's reset. Returns { ok, text }. Never throws.
   async function useReset(t) {
     if (t.kind === 'codex') {
-      const attempt = codexResetGuard.markAttempt(t, state.codex.usage);
+      const archived = t.active === false;
+      const attempt = codexResetGuard.markAttempt(t, t.usage ?? state.codex.usage);
       const r = await consumeCodexResetCredit(t.auth, t.grant.id, { requestId: attempt.requestId });
       codexResetGuard.finishAttempt(attempt, r);
-      state.codex.lastAt = 0; state.codex.backoffUntil = 0; // re-fetch quota + credits on the next probe
-      if (r.error) return { ok: false, text: `${paint.red('codex reset failed:')} ${r.error}` };
-      if (r.windowsReset > 0) return { ok: true, text: `${paint.green('codex reset used')} · ${r.windowsReset} window${r.windowsReset === 1 ? '' : 's'} reset · ${Math.max(0, t.banked - 1)} left` };
-      return { ok: false, text: `${paint.yellow('codex: nothing reset')} · server said ${r.code}` };
+      // Re-fetch quota + credits on the next probe.
+      if (archived) cxOther(t.key).nextAt = 0;
+      else { state.codex.lastAt = 0; state.codex.backoffUntil = 0; }
+      const on = archived ? ` on ${paint.cyan(t.name.replace(/^codex /, ''))}` : '';
+      if (r.error) return { ok: false, text: `${paint.red('codex reset failed:')}${on} ${r.error}` };
+      if (r.windowsReset > 0) return { ok: true, text: `${paint.green('codex reset used')}${on} · ${r.windowsReset} window${r.windowsReset === 1 ? '' : 's'} reset · ${Math.max(0, t.banked - 1)} left` };
+      return { ok: false, text: `${paint.yellow('codex: nothing reset')}${on} · server said ${r.code}` };
     }
     const r = await claimReset(t.token, t.org, t.grant.id);
     for (const f of [CACHE_FILE, FAIL_FILE]) { try { unlinkSync(f); } catch { /* none */ } } // stale numbers: everyone re-fetches
@@ -464,11 +587,11 @@ export function createApp({ live = false } = {}) {
     }
   }
 
-  return { state, probe, probeCodex, probeOthersDue, pollSessions, resetTargetFor, useReset };
+  return { state, probe, probeCodex, probeCodexOthers, probeOthersDue, pollSessions, resetTargetFor, useReset };
 }
 
 // ─── Live TUI ────────────────────────────────────────────────────────────────
-function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, resetTargetFor, useReset }) {
+function runLive({ state, probe, probeCodex, probeCodexOthers, probeOthersDue, pollSessions, resetTargetFor, useReset }) {
   const out = process.stdout;
   const altScreen = !!out.isTTY;
   if (altScreen) out.write(`${ESC}?1049h${ESC}?25l`);
@@ -512,9 +635,26 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
       if (on) reprobe();
       return;
     }
-    if (row?.kind === 'codex') { say(paint.dim('codex: one account, nothing to switch — u spends a banked reset')); return; }
+    if (row?.kind === 'codex') {
+      if (row.active) { say(paint.dim('already the logged-in codex account — u spends a banked reset')); return; }
+      switchCodex(row);
+      return;
+    }
     if (!row || row.active) { say(paint.dim('already the logged-in account')); return; }
     switchToEmail(row.email, 'switched to');
+  }
+
+  // Write an archived Codex account into auth.json. Not while its token is
+  // being refreshed: the write could carry a refresh token about to rotate.
+  function switchCodex(row) {
+    if (state.codexOthers.get(row.key)?.inFlight) { say(paint.dim(`${row.name}: probe in flight — press enter again in a moment`)); return; }
+    try {
+      const r = switchCodexTo(row.key);
+      say(`${paint.green('codex switched to')} ${paint.cyan(row.name)}${r.running ? paint.yellow(` — ${r.running} running codex session(s) may keep the old account until restarted`) : ''}`);
+      const cx = state.codex;
+      Object.assign(cx, { usage: null, usageAt: null, credits: null, creditsAt: null, lastAt: 0, backoffUntil: 0, error: null });
+      Promise.all([probeCodex(true), probeCodexOthers(true)]).catch(e => say(`${paint.red('probe failed:')} ${firstLine(e)}`)).then(draw);
+    } catch (e) { say(`${paint.red('codex switch failed:')} ${firstLine(e)}`); }
   }
 
   // `d` on a Claude card opts that account out of (or back into) auto-switching.
@@ -564,11 +704,48 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
     switchToEmail(c.email, 'auto-switched to');
   }
 
-  let loggingIn = false;
+  // `l` asks which provider; the next key answers (c / x), anything else cancels.
+  let loggingIn = false, loginPickAt = 0;
+  function askLogin() {
+    if (loggingIn) { say(paint.dim('login already in progress — finish it in the browser')); return; }
+    if (opts.noCodex) { doLogin(); return; }
+    loginPickAt = Date.now();
+    say(`${paint.cyan('log in to which provider?')} ${paint.bold('c')} Claude · ${paint.bold('x')} Codex ${paint.dim('· any other key cancels')}`);
+  }
+  function loginPickKey(k) {
+    if (!loginPickAt) return false;
+    const fresh = Date.now() - loginPickAt < MSG_TTL_MS;
+    loginPickAt = 0;
+    if (!fresh) return false;
+    if (k === 'c' || k === 'C') doLogin();
+    else if (k === 'x' || k === 'X') doCodexLogin();
+    else if (k === 'q' || k === '\x03') return false;
+    else say(paint.dim('login cancelled'));
+    return true;
+  }
+
+  function doCodexLogin() {
+    loggingIn = true;
+    say(paint.cyan('starting codex login…'));
+    codexLogin({ onStatus: m => { say(paint.cyan(m)); draw(); } })
+      .then(raw => {
+        const r = storeCodexLogin(raw);
+        say(paint.green(r.text));
+        const o = state.codexOthers.get(r.key);
+        if (o) Object.assign(o, { authDead: false, unauthorized: false, error: null, nextAt: 0, refreshTriedAt: 0 });
+        if (r.activated) state.codex.lastAt = 0;
+        return Promise.all([probeCodex(true), probeCodexOthers(true)]).then(() => {
+          const i = rowList(state).findIndex(x => x.kind === 'codex' && x.key === r.key);
+          if (i >= 0) state.sel = i;
+        });
+      })
+      .catch(e => say(`${paint.red('codex login failed:')} ${firstLine(e)}`))
+      .finally(() => { loggingIn = false; draw(); });
+  }
+
   function doLogin() {
     if (loggingIn) { say(paint.dim('login already in progress — finish it in the browser')); return; }
     const row = rowList(state)[state.sel];
-    if (row?.kind === 'codex' || row?.kind === 'codex-auto') { say(paint.dim('codex logs in on its own: run `codex login`')); return; }
     loggingIn = true;
     const c = row?.kind === 'claude' ? row : null;
     say(paint.cyan('starting browser login…'));
@@ -648,13 +825,14 @@ function runLive({ state, probe, probeCodex, probeOthersDue, pollSessions, reset
     process.stdin.on('data', k => {
       if (k !== 'u') state.confirm = null; // anything but the second `u` cancels a pending reset
       state.whatsNew = null; // the what's-new card goes away on the first keypress
+      if (loginPickKey(k)) { draw(); return; }
       if (bannerKey(k)) { draw(); return; }
       if (k === 'q' || k === '\x03') process.exit(0); // q or Ctrl-C
       else if (k === 'r') reprobe();
       else if (k === '\x1b[A' || k === 'k') state.sel = Math.max(0, state.sel - 1);
       else if (k === '\x1b[B' || k === 'j') state.sel = Math.min(rowList(state).length - 1, state.sel + 1);
       else if (k === '\r' || k === '\n') doSwitch();
-      else if (k === 'l') doLogin();
+      else if (k === 'l') askLogin();
       else if (k === 'u') doUseReset();
       else if (k === 'd') doToggleDisabled();
       draw();

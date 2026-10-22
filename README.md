@@ -1,6 +1,6 @@
 # agent-usage
 
-Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress, spend a banked limit reset with another. Plus a Codex (ChatGPT) card when `~/.codex/auth.json` exists.
+Live Claude (Max/Pro) quota in the terminal, for every account you log into. Switch Claude Code between accounts with one keypress, spend a banked limit reset with another. Codex (ChatGPT) accounts get the same treatment: one card each, switch with Enter.
 
 ## Screenshot
 
@@ -65,7 +65,7 @@ Then:
 
 1. Check it works: `agent-usage --once`. You should see one card for the account Claude Code is logged into.
 2. Run the live dashboard: `agent-usage`.
-3. Add more accounts: press `l` in the dashboard (browser login), or run `claude /login` with another account while the dashboard is open. Each account gets its own card and stays there.
+3. Add more accounts: press `l` in the dashboard and pick `c` (Claude) or `x` (Codex) for a browser login, or run `claude /login` with another account while the dashboard is open. Each account gets its own card and stays there.
 
 If the installer warns that `~/.local/bin` is not on your `PATH`, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new terminal.
 
@@ -102,24 +102,27 @@ agent-usage --json           # endpoint JSON for the logged-in account (may come
 agent-usage --no-codex       # hide the Codex (ChatGPT) card
 agent-usage --no-color
 
-agent-usage list             # list archived accounts (token / refresh validity, session usage)
+agent-usage list             # list archived accounts, Claude and Codex (token / refresh validity, session usage)
 agent-usage select EMAIL     # make EMAIL the logged-in Claude Code account
+agent-usage select codex:EMAIL # make EMAIL the logged-in Codex account (writes ~/.codex/auth.json)
 agent-usage whoami           # print the logged-in account's email
 agent-usage status           # print the dashboard once and exit (same as --once)
 agent-usage json             # same as --json
-agent-usage forget EMAIL     # drop an archived account
+agent-usage forget EMAIL     # drop an archived account (codex:EMAIL for a Codex one)
 agent-usage login            # browser login (PKCE), archive + activate
+agent-usage login codex      # add a Codex account (runs `codex login` in a throwaway CODEX_HOME)
 agent-usage auto [on|off]    # show or set auto-switch (see below)
 agent-usage reset EMAIL      # spend one banked limit reset on that Claude account (no confirmation)
-agent-usage reset codex      # spend one Codex reset credit
+agent-usage reset codex      # spend one Codex reset credit (logged-in Codex account)
+agent-usage reset codex:EMAIL # spend one on that archived Codex account
 agent-usage auto-reset [on|off] # show or set Codex auto use reset
 agent-usage update           # pull the latest version now (see Updates)
 agent-usage auto-update [on|off] # show or set auto-update (default on)
 ```
 
-`select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`). The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
+`select`/`forget` accept any unique substring of an archived email (`agent-usage select nino`, `agent-usage select codex:luka`). When one email has two ChatGPT workspaces (say personal and team), use the account id that `list` prints. The dashed forms (`--accounts`, `--switch EMAIL`, `--forget EMAIL`, `--login`) still work as aliases.
 
-Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle automation) · `u` use a banked reset on the selected card (press twice) · `d` disable/enable the selected Claude account for auto-switch · `l` browser login · `r` probe now · `q` quit.
+Live keys: `↑/↓` (or `j/k`) select · `Enter` switch (or toggle automation) · `u` use a banked reset on the selected card (press twice) · `d` disable/enable the selected Claude account for auto-switch · `l` browser login (then `c` Claude or `x` Codex; any other key cancels) · `r` probe now · `q` quit.
 
 ## Auto-switch
 
@@ -192,9 +195,18 @@ The logged-in card can lag: a probe served from the shared cache (written by the
 
 **In the TUI** the first `u` shows what would be spent and asks for a second `u` within 10 s; any other key cancels. The one-shot `agent-usage reset EMAIL|codex` skips the confirmation (it re-probes first so it acts on a fresh grant list).
 
-## The Codex card
+## The Codex cards
 
-When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, one extra card shows Codex quota: `GET chatgpt.com/backend-api/codex/usage` — the endpoint `codex` itself polls for its rate-limit display — probed every 5 minutes (every 30 seconds with auto use reset enabled), together with the banked reset credits. Rows are the account's main rate-limit windows (a ≤6h window renders like a Session, a 7d one like Weekly; separately-metered extras like Spark are not shown), then the same columns as a Claude card: `Extra` (always `–`), `Resets`, and `Sessions` = running `codex` processes (daemons like `codex app-server` excluded). The auth file is never written and the token never refreshed — the Codex CLI does that itself on its next run; the only write is consuming a reset via `u`, `reset codex`, or the optional auto use reset toggle. One account only; no switching. Hide it with `--no-codex`.
+When `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) holds ChatGPT tokens, a Codex card shows its quota: `GET chatgpt.com/backend-api/codex/usage` — the endpoint `codex` itself polls for its rate-limit display — probed every 5 minutes (every 30 seconds with auto use reset enabled), together with the banked reset credits. Rows are the account's main rate-limit windows (a ≤6h window renders like a Session, a 7d one like Weekly; separately-metered extras like Spark are not shown), then the same columns as a Claude card: `Extra` (always `–`), `Resets`, and `Sessions` = running `codex` processes (daemons like `codex app-server` excluded). The logged-in token is never refreshed by agent-usage; the Codex CLI does that itself on its next run. Hide the section with `--no-codex`.
+
+### Several Codex accounts
+
+- Every Codex account seen in `auth.json` is archived under `~/.local/state/agent-usage/codex-accounts/<account id>.json` (mode 600): the whole `auth.json` as Codex wrote it, plus the last usage and credits. The one logged in when you first run this version is imported automatically.
+- Add another with `l` → `x` (or `agent-usage login codex`). That runs `codex login` with a throwaway `CODEX_HOME`, so the account you are logged into stays put; the new one lands in the archive as a `○` card. It becomes the logged-in account only when no Codex account is logged in yet. Logging in with `codex login` yourself works too: the new account is picked up and the previous one stays archived.
+- `Enter` on an archived card (or `select codex:EMAIL`) archives the current `auth.json` first, then writes the chosen account's file there. New `codex` sessions use it. Running sessions may keep the old account until restarted, and one that refreshes its token later can write the old account back into `auth.json`. Restart running sessions after a switch.
+- Archived cards poll usage + credits every 5 minutes (jittered), each with its own token. Access tokens last about 10 days; an archived one is refreshed in its last 2 days with the Codex CLI's own refresh call (`auth.openai.com/oauth/token`, same client id and scope), under a per-account lock. The logged-in account is never refreshed by agent-usage. A rejected refresh shows `needs login`: log in to that account again with `l` → `x`.
+- `u` works on any Codex card. Auto use reset only acts on the logged-in account.
+- The same email can have two ChatGPT workspaces (personal and team); each is its own card, and the plan is shown next to the email to tell them apart.
 
 ## Multiple accounts
 
@@ -247,6 +259,8 @@ src/oauth.mjs         token refresh, browser PKCE login, profile
 src/switch.mjs        switchTo / storeLogin
 src/usage.mjs         usage endpoint, shared cache, normalisation
 src/local.mjs         running claude processes
+src/codex.mjs         Codex usage, reset credits, auth.json parsing
+src/codex-accounts.mjs Codex archive, switching, archived-token refresh, `codex login`
 src/codex-auto.mjs    Codex auto reset setting, thresholds, repeat-claim guard
 src/update.mjs        self-update: upstream check, ff-only pull + npm ci, relaunch
 src/format.mjs        ANSI paint, bars, number/duration formatting
