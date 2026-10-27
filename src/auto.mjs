@@ -1,7 +1,7 @@
 // Auto-switch: when the logged-in session (or its weekly) hits the threshold,
 // move to the eligible account whose session window resets soonest. Eligible =
-// session, weekly and Fable all under the threshold, refresh token alive, not
-// disabled by the user. An idle account (no active window) counts as a full 5h
+// session and weekly under the threshold (Fable is ignored), refresh token
+// alive, not disabled by the user. An idle account (no active window) counts as a full 5h
 // from reset — a fresh window starts on use.
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -63,7 +63,7 @@ export function pickCandidate(activeEmail, others = new Map(), now = Date.now())
     const s = rec.usage ? usageSummary(normalize(rec.usage), now) : null;
     if (!s) continue; // never probed: usage unknown, do not switch blind
     // A free session is useless once the weekly bucket is spent.
-    if (s.sess < AUTO_THRESHOLD && s.week < AUTO_THRESHOLD && s.fable < AUTO_THRESHOLD) cands.push({ email: rec.email, ...s });
+    if (s.sess < AUTO_THRESHOLD && s.week < AUTO_THRESHOLD) cands.push({ email: rec.email, ...s });
   }
   cands.sort((a, b) => a.tts - b.tts);
   return cands[0] || null;

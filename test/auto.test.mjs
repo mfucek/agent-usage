@@ -32,6 +32,12 @@ test('a free session on a spent weekly is not a candidate', () => {
   assert.equal(pickCandidate('active@example.com', new Map(), now)?.email, 'viable@example.com');
 });
 
+test('a spent Fable bucket does not block a candidate', () => {
+  acct('fable-spent@example.com', { ...usage(15, 54, 5 * 60_000), seven_day_fable: { utilization: 92, resets_at: iso(86_400_000) } });
+  assert.equal(pickCandidate('active@example.com', new Map(), now)?.email, 'fable-spent@example.com');
+  acct('fable-spent@example.com', usage(15, 100, 5 * 60_000)); // retire it for the tests below
+});
+
 test('d opts an account out of auto-switch and shows it as disabled', () => {
   assert.equal(toggleDisabled('Viable@example.com'), true);
   assert.ok(isDisabled('viable@example.com'));
